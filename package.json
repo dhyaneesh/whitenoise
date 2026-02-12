@@ -1,0 +1,26 @@
+{
+  "name": "whitenoise",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts"
+  },
+  "dependencies": {
+    "@0xshariq/github-mcp-server": "^2.5.0",
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@modelcontextprotocol/server-filesystem": "^2026.1.14",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "autoprefixer": "^10.4.24",
+    "esbuild": "^0.20.2",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^4.1.18",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.4.5"
+  }
+}
