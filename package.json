@@ -12,6 +12,7 @@
     "@0xshariq/github-mcp-server": "^2.5.0",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "@modelcontextprotocol/server-filesystem": "^2026.1.14",
+    "@playwright/mcp": "^0.0.64",
     "zod": "^3.23.8"
   },
   "devDependencies": {

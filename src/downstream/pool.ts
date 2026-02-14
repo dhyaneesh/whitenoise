@@ -132,7 +132,7 @@ export class DownstreamPool {
       try {
         await new Promise(r => setTimeout(r, attempt * 1000));
         await this.startServer(state.config);
-        console.info('[downstream] reconnected:', name);
+        console.error('[downstream] reconnected:', name);
         this.notifyChange();
         return;
       } catch (err) {

@@ -198,7 +198,7 @@ export class ExecutionManager {
     this.activeRun = null;
 
     if (msg.payload.ok) {
-      console.info('[exec] run complete', {
+      console.error('[exec] run complete', {
         durationMs: msg.payload.durationMs,
         stdoutBytes: stdout.length,
         stderrBytes: stderr.length,
@@ -278,13 +278,10 @@ export class ExecutionManager {
 
     this.worker.stdout?.on('data', (chunk: Buffer) => {
       this.appendOutput('stdout', chunk);
-      // Also echo to main stderr for visibility
-      process.stderr.write(chunk);
     });
 
     this.worker.stderr?.on('data', (chunk: Buffer) => {
       this.appendOutput('stderr', chunk);
-      process.stderr.write(chunk);
     });
 
     this.worker.on('message', (msg: WorkerToMain) => {

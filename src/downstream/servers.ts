@@ -24,13 +24,13 @@ export const DOWNSTREAM_SERVERS: DownstreamServer[] = [
     ],
   },
   {
-    name: 'everything',
-    command: 'npx',
-    args: ['-y', '@modelcontextprotocol/server-everything'],
-  },
-  {
     name: 'memory',
     command: 'npx',
     args: ['-y', '@modelcontextprotocol/server-memory'],
+  },
+  {
+    name: 'playwright',
+    command: 'npx',
+    args: ['-y', '@playwright/mcp@latest'],
   },
 ];
