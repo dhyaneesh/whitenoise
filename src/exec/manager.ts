@@ -1,10 +1,14 @@
 // src/exec/manager.ts
 import { Worker } from 'node:worker_threads';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import type { WorkerToMain, MainToWorker, CallToolMessage } from './protocol.js';
 import { parseFqTool } from '../downstream/names.js';
 import type { DownstreamPool } from '../downstream/pool.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_QUEUE_LENGTH = 50;
@@ -265,7 +269,7 @@ export class ExecutionManager {
   }
 
   private spawnWorker(): void {
-    const workerPath = path.resolve('dist/exec/worker.js');
+    const workerPath = path.join(__dirname, 'worker.js');
 
     this.worker = new Worker(workerPath, {
       stdout: true,

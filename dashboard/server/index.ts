@@ -94,9 +94,9 @@ async function main() {
 
   app.post('/api/llm/run-vanilla', async (req, res) => {
     try {
-      const apiKey = process.env.OPENAI_API_KEY;
+      const apiKey = process.env.GEMINI_API_KEY;
       if (!apiKey) {
-        res.status(500).json({ error: 'OPENAI_API_KEY not set' });
+        res.status(500).json({ error: 'GEMINI_API_KEY not set' });
         return;
       }
       const { task, model } = req.body as { task?: string; model?: string };
@@ -114,9 +114,9 @@ async function main() {
 
   app.post('/api/llm/run-whitenoise', async (req, res) => {
     try {
-      const apiKey = process.env.OPENAI_API_KEY;
+      const apiKey = process.env.GEMINI_API_KEY;
       if (!apiKey) {
-        res.status(500).json({ error: 'OPENAI_API_KEY not set' });
+        res.status(500).json({ error: 'GEMINI_API_KEY not set' });
         return;
       }
       const { task, model } = req.body as { task?: string; model?: string };

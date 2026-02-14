@@ -1,3 +1,10 @@
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+/** Resolves to the repo root (two levels up from src/downstream/) */
+const PROJECT_ROOT = path.resolve(__dirname, '../..');
+
 export type DownstreamServer = {
   name: string; // stable ID (used in fqTool)
   command: string; // executable
@@ -13,7 +20,7 @@ export const DOWNSTREAM_SERVERS: DownstreamServer[] = [
     args: [
       '-y',
       '@modelcontextprotocol/server-filesystem',
-      process.cwd(), // IMPORTANT: allow repo root
+      PROJECT_ROOT, // absolute path — works even when cwd isn't respected
     ],
   },
   {
@@ -26,17 +33,18 @@ export const DOWNSTREAM_SERVERS: DownstreamServer[] = [
     command: 'npx',
     args: ['-y', '@modelcontextprotocol/server-memory'],
   },
-  {
-    name: 'github-mcp-server',
-    command: 'npx',
-    args: [
-      '-y',
-      '--package=@0xshariq/github-mcp-server@latest',
-      '--',
-      'node',
-      '--input-type=module',
-      '--eval',
-      'import("@0xshariq/github-mcp-server/dist/index.js")',
-    ],
-  },
+  // TODO: re-enable once cwd issue is resolved for --eval imports
+  // {
+  //   name: 'github-mcp-server',
+  //   command: 'npx',
+  //   args: [
+  //     '-y',
+  //     '--package=@0xshariq/github-mcp-server@latest',
+  //     '--',
+  //     'node',
+  //     '--input-type=module',
+  //     '--eval',
+  //     'import("@0xshariq/github-mcp-server/dist/index.js")',
+  //   ],
+  // },
 ];

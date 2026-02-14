@@ -17,7 +17,7 @@ npm run dev
 
 This builds the parent WhiteNoise project (if needed), starts the API server on **http://localhost:3001**, and the Vite dev server (with proxy to the API). Open the URL Vite prints (e.g. http://localhost:5173).
 
-**Real LLM comparison:** The "Real LLM comparison" section uses the OpenAI API. Set `OPENAI_API_KEY` in the environment when starting the server (e.g. `OPENAI_API_KEY=sk-... npm run dev` or export it in your shell).
+**Real LLM comparison:** The "Real LLM comparison" section uses the Google Gemini API. Set `GEMINI_API_KEY` in the environment when starting the server (e.g. `GEMINI_API_KEY=your-key npm run dev` or export it in your shell). You can get an API key from [Google AI Studio](https://aistudio.google.com/apikey).
 
 ## Run frontend only (API already running)
 

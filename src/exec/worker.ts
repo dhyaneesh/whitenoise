@@ -2,11 +2,17 @@
 import { parentPort } from 'node:worker_threads';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { mkdir, writeFile, rm } from 'node:fs/promises';
 import { build } from 'esbuild';
 import { pathToFileURL } from 'node:url';
 import type { MainToWorker, WorkerToMain } from './protocol.js';
 import { mcpResolverPlugin } from './esbuildPlugin.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+/** Resolves to the project root (two levels up from dist/exec/) */
+const PROJECT_ROOT = path.resolve(__dirname, '../..');
 
 const MAX_EXEC_MS = 60_000;
 
@@ -32,7 +38,7 @@ parentPort!.on('message', async (msg: MainToWorker) => {
   if (msg.type === 'run') {
     const start = Date.now();
     const runId = msg.id;
-    const execDir = path.join(process.cwd(), '.exec', runId);
+    const execDir = path.join(PROJECT_ROOT, '.exec', runId);
 
     // Hard execution ceiling - manager will catch crash + respawn
     const hardTimeout = setTimeout(() => {

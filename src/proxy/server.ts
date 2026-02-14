@@ -23,7 +23,7 @@ export function createProxyServer(
   // ---- search_tools ----
   server.tool(
     'search_tools',
-    'Search the downstream tool catalog by name or description',
+    'Search the downstream tool catalog by name or description. Each result includes a specifier you can pass to read_module to get the wrapper source.',
     SearchToolsInput.shape,
     async ({ query, limit }) => {
       try {
@@ -52,7 +52,7 @@ export function createProxyServer(
   // ---- list_modules ----
   server.tool(
     'list_modules',
-    'List all generated wrapper modules for downstream tools',
+    'List wrapper module specifiers. Use when search_tools does not find what you need (fallback for full context).',
     ListModulesInput.shape,
     async ({ path }) => {
       try {
@@ -72,7 +72,7 @@ export function createProxyServer(
   // ---- read_module ----
   server.tool(
     'read_module',
-    'Read the source code of a wrapper module',
+    'Return the source code of a wrapper module. Use the specifier from search_tools results (or from list_modules).',
     ReadModuleInput.shape,
     async ({ specifier }) => {
       try {

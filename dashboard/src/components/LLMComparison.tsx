@@ -78,7 +78,7 @@ export function LLMComparison() {
     <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-6">
       <h2 className="mb-2 text-lg font-semibold">Real LLM comparison</h2>
       <p className="mb-4 text-sm text-zinc-400">
-        Same task with real OpenAI calls: Vanilla MCP (all tools in context) vs WhiteNoise (4 meta-tools). Set <code className="rounded bg-zinc-800 px-1">OPENAI_API_KEY</code> in the server env.
+        Same task with real Gemini calls: Vanilla MCP (all tools in context) vs WhiteNoise (4 meta-tools). Set <code className="rounded bg-zinc-800 px-1">GEMINI_API_KEY</code> in the server env.
       </p>
 
       <div className="mb-4">

@@ -49,7 +49,14 @@ export class DownstreamPool {
   }
 
   async startAll(): Promise<void> {
-    await Promise.all(DOWNSTREAM_SERVERS.map(s => this.startServer(s)));
+    const results = await Promise.allSettled(
+      DOWNSTREAM_SERVERS.map(s => this.startServer(s))
+    );
+    for (const r of results) {
+      if (r.status === 'rejected') {
+        console.error('[downstream] server failed to start:', r.reason);
+      }
+    }
   }
 
   async stopAll(): Promise<void> {
