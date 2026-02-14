@@ -1,16 +1,7 @@
-import { useEffect, useState } from 'react';
-import { fetchContext } from '../api';
-import type { ContextComparison as ContextType } from '../types';
+import { useContextData } from '../hooks/useContextData';
 
 export function ContextComparison() {
-  const [context, setContext] = useState<ContextType | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    fetchContext()
-      .then(setContext)
-      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
-  }, []);
+  const { context, error } = useContextData();
 
   if (error) {
     return (

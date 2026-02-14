@@ -2,15 +2,7 @@ import path from 'node:path';
 import { mkdir, writeFile } from 'node:fs/promises';
 import type { ToolCatalog, CatalogEntry } from '../downstream/catalog.js';
 import { zodToSource } from '../downstream/schemaConverter.js';
-
-function toCamelCase(name: string): string {
-  return name
-    .split(/[_-]/)
-    .map((part, i) =>
-      i === 0 ? part : part.charAt(0).toUpperCase() + part.slice(1)
-    )
-    .join('');
-}
+import { toCamelCase } from '../downstream/names.js';
 
 function toPascalCase(name: string): string {
   return name

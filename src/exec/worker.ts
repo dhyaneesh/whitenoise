@@ -2,10 +2,9 @@
 import { parentPort } from 'node:worker_threads';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { mkdir, writeFile, rm } from 'node:fs/promises';
 import { build } from 'esbuild';
-import { pathToFileURL } from 'node:url';
 import type { MainToWorker, WorkerToMain } from './protocol.js';
 import { mcpResolverPlugin } from './esbuildPlugin.js';
 
@@ -112,10 +111,3 @@ parentPort!.on('message', async (msg: MainToWorker) => {
   }
 });
 
-// Export for cleanup on crash (called by manager if needed)
-export function rejectAllPending(error: Error): void {
-  for (const [id, p] of pending) {
-    p.reject(error);
-  }
-  pending.clear();
-}

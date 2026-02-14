@@ -1,3 +1,4 @@
+import { useMemo } from 'react';
 import {
   BarChart,
   Bar,
@@ -21,14 +22,25 @@ const scenarioNames: Record<string, string> = {
   'chain-5': '5-tool chain',
 };
 
+const tooltipContentStyle = {
+  backgroundColor: '#27272a',
+  border: '1px solid #3f3f46',
+  borderRadius: '8px',
+};
+
+const tooltipLabelStyle = { color: '#d4d4d8' };
+
 export function LatencyChart({ results }: LatencyChartProps) {
-  const data =
-    results?.map((r) => ({
-      name: scenarioNames[r.scenarioId] ?? r.scenarioId,
-      scenarioId: r.scenarioId,
-      Vanilla: Math.round(r.vanilla.latencyMs),
-      WhiteNoise: Math.round(r.whitenoise.latencyMs),
-    })) ?? [];
+  const data = useMemo(
+    () =>
+      results?.map((r) => ({
+        name: scenarioNames[r.scenarioId] ?? r.scenarioId,
+        scenarioId: r.scenarioId,
+        Vanilla: Math.round(r.vanilla.latencyMs),
+        WhiteNoise: Math.round(r.whitenoise.latencyMs),
+      })) ?? [],
+    [results]
+  );
 
   return (
     <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-6">
@@ -44,12 +56,8 @@ export function LatencyChart({ results }: LatencyChartProps) {
             <XAxis dataKey="name" stroke="#a1a1aa" fontSize={12} />
             <YAxis stroke="#a1a1aa" fontSize={12} />
             <Tooltip
-              contentStyle={{
-                backgroundColor: '#27272a',
-                border: '1px solid #3f3f46',
-                borderRadius: '8px',
-              }}
-              labelStyle={{ color: '#d4d4d8' }}
+              contentStyle={tooltipContentStyle}
+              labelStyle={tooltipLabelStyle}
             />
             <Legend />
             <Bar dataKey="Vanilla" fill="#ef4444" radius={[4, 4, 0, 0]} />

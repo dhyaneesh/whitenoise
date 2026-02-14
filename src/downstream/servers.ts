@@ -33,18 +33,4 @@ export const DOWNSTREAM_SERVERS: DownstreamServer[] = [
     command: 'npx',
     args: ['-y', '@modelcontextprotocol/server-memory'],
   },
-  // TODO: re-enable once cwd issue is resolved for --eval imports
-  // {
-  //   name: 'github-mcp-server',
-  //   command: 'npx',
-  //   args: [
-  //     '-y',
-  //     '--package=@0xshariq/github-mcp-server@latest',
-  //     '--',
-  //     'node',
-  //     '--input-type=module',
-  //     '--eval',
-  //     'import("@0xshariq/github-mcp-server/dist/index.js")',
-  //   ],
-  // },
 ];

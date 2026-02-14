@@ -1,8 +1,6 @@
 import { useEffect, useState } from 'react';
 import { fetchScenarios, runBenchmark, runAllBenchmarks } from '../api';
-import type { Scenario } from '../types';
-import type { BenchmarkResult } from '../types';
-import type { RunAllResultItem } from '../types';
+import type { Scenario, BenchmarkResult, RunAllResultItem } from '../types';
 import { ScenarioCard } from './ScenarioCard';
 
 type BenchmarkRunnerProps = {
@@ -21,7 +19,9 @@ export function BenchmarkRunner({ onRunAllComplete }: BenchmarkRunnerProps) {
     fetchScenarios()
       .then((list) => {
         setScenarios(list);
-        if (list.length > 0 && !selectedId) setSelectedId(list[0].id);
+        if (list.length > 0) {
+          setSelectedId((prev) => prev || list[0].id);
+        }
       })
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
   }, []);

@@ -4,7 +4,7 @@ import { rm, mkdir } from 'node:fs/promises';
 import type { ToolCatalog } from '../downstream/catalog.js';
 import { generateWrappers } from './generate.js';
 
-export const baseTmp = path.join(os.tmpdir(), 'meta-mcp-proxy');
+const baseTmp = path.join(os.tmpdir(), 'meta-mcp-proxy');
 export const wrappersDir = path.join(baseTmp, 'wrappers');
 
 export async function prepareWrappers(catalog: ToolCatalog): Promise<void> {
