@@ -104,8 +104,8 @@ async function main() {
         res.status(400).json({ error: 'task (string) required' });
         return;
       }
-      const { runVanilla } = await import('./llmRun.js');
-      const result = await runVanilla(task, pool, catalog, apiKey, model);
+      const { runVanillaAgent } = await import('./agents.js');
+      const result = await runVanillaAgent(task, pool, catalog, apiKey, model);
       res.json(result);
     } catch (err: unknown) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -124,8 +124,8 @@ async function main() {
         res.status(400).json({ error: 'task (string) required' });
         return;
       }
-      const { runWhiteNoise } = await import('./llmRun.js');
-      const result = await runWhiteNoise(task, pool, catalog, execMgr, modules, apiKey, model);
+      const { runWhiteNoiseAgent } = await import('./agents.js');
+      const result = await runWhiteNoiseAgent(task, pool, catalog, execMgr, modules, apiKey, model);
       res.json(result);
     } catch (err: unknown) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });

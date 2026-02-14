@@ -76,9 +76,9 @@ export function LLMComparison() {
 
   return (
     <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-6">
-      <h2 className="mb-2 text-lg font-semibold">Real LLM comparison</h2>
+      <h2 className="mb-2 text-lg font-semibold">Two agents: Vanilla MCP vs WhiteNoise</h2>
       <p className="mb-4 text-sm text-zinc-400">
-        Same task with real Gemini calls: Vanilla MCP (all tools in context) vs WhiteNoise (4 meta-tools). Set <code className="rounded bg-zinc-800 px-1">GEMINI_API_KEY</code> in the server env.
+        Same task with real Gemini calls via <strong>LangChain-JS (LangGraph)</strong>: <strong>Vanilla MCP</strong> agent (all downstream tools in context) vs <strong>WhiteNoise</strong> agent (4 meta-tools). Set <code className="rounded bg-zinc-800 px-1">GEMINI_API_KEY</code> in the server env. Optional: <code className="rounded bg-zinc-800 px-1">LANGSMITH_TRACING</code> and <code className="rounded bg-zinc-800 px-1">LANGSMITH_API_KEY</code> for cost tracking.
       </p>
 
       <div className="mb-4">
