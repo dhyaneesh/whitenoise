@@ -18,23 +18,46 @@ export type CatalogEntry = {
   outputSchema?: z.ZodTypeAny;
 };
 
+/** Internal entry with precomputed lowercase fields for search */
+type IndexedEntry = CatalogEntry & {
+  toolLower: string;
+  fqToolLower: string;
+  descLower: string;
+};
+
 export class ToolCatalog {
-  private entries: CatalogEntry[] = [];
+  private entries: IndexedEntry[] = [];
+  /** Deterministic browse order — rebuilt on refresh */
+  private browseOrder: IndexedEntry[] = [];
 
   constructor(private pool: DownstreamPool) {}
 
   /**
-   * Refresh catalog by querying all downstream servers.
-   * Call once at boot (or later if you add hot-reload).
+   * Refresh catalog by querying all downstream servers in parallel.
+   * A single failing server is logged and skipped (does not abort the refresh).
    */
   async refresh(): Promise<void> {
-    const all: CatalogEntry[] = [];
-
-    // Reach into the pool's known servers
     const serverNames = this.pool.getServerNames();
 
-    for (const server of serverNames) {
-      const tools = await this.pool.listTools(server);
+    const results = await Promise.allSettled(
+      serverNames.map(async (server) => {
+        const tools = await this.pool.listTools(server);
+        return { server, tools };
+      })
+    );
+
+    const all: IndexedEntry[] = [];
+
+    for (const result of results) {
+      if (result.status === 'rejected') {
+        console.error(
+          '[catalog] listTools failed for a server:',
+          result.reason
+        );
+        continue;
+      }
+
+      const { server, tools } = result.value;
 
       for (const tool of tools) {
         const fqTool = makeFqTool(server, tool.name);
@@ -44,27 +67,34 @@ export class ToolCatalog {
           throw new Error(`Invalid fqTool generated: ${fqTool}`);
         }
 
+        const description = tool.description;
         all.push({
           server,
           tool: tool.name,
           fqTool,
           specifier: makeSpecifier(server, tool.name),
-          description: tool.description,
+          description,
           inputSchema: jsonSchemaToZod(tool.inputSchema),
           inputSchemaRaw: tool.inputSchema,
           outputSchema: MCPResultSchema,
+          toolLower: tool.name.toLowerCase(),
+          fqToolLower: fqTool.toLowerCase(),
+          descLower: description?.toLowerCase() ?? '',
         });
       }
     }
 
     this.entries = all;
+    this.browseOrder = [...all].sort(
+      (a, b) => a.tool.localeCompare(b.tool) || a.fqTool.localeCompare(b.fqTool)
+    );
   }
 
   /**
-   * Return all catalog entries.
+   * Return all catalog entries (public fields only).
    */
   listAll(): CatalogEntry[] {
-    return [...this.entries];
+    return this.entries.map(toPublic);
   }
 
   /**
@@ -75,54 +105,54 @@ export class ToolCatalog {
 
     // Empty query: fall back to a deterministic "browse" listing.
     if (!trimmed) {
-      return [...this.entries]
-        .sort((a, b) => a.tool.localeCompare(b.tool) || a.fqTool.localeCompare(b.fqTool))
-        .slice(0, limit);
+      return this.browseOrder.slice(0, limit).map(toPublic);
     }
 
     // Tokenize query into words (whitespace + punctuation).
     const words = trimmed.split(/[^a-z0-9]+/i).filter(Boolean);
 
-    const scored = this.entries.map((entry) => ({
-      entry,
-      score: scoreEntry(entry, words),
-    }));
+    const scored: { entry: IndexedEntry; score: number }[] = [];
+    for (const entry of this.entries) {
+      const score = scoreEntry(entry, words);
+      if (score > 0) scored.push({ entry, score });
+    }
 
-    const positive = scored
-      .filter((r) => r.score > 0)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, limit)
-      .map((r) => r.entry);
+    if (scored.length === 0) {
+      // Empty-result fallback: browse-style list so the caller can still discover tools.
+      return this.browseOrder.slice(0, limit).map(toPublic);
+    }
 
-    if (positive.length > 0) return positive;
-
-    // Empty-result fallback: if nothing scores above zero, return a
-    // deterministic browse-style list so the caller can still discover tools.
-    return [...this.entries]
-      .sort((a, b) => a.tool.localeCompare(b.tool) || a.fqTool.localeCompare(b.fqTool))
-      .slice(0, limit);
+    scored.sort((a, b) => b.score - a.score);
+    return scored.slice(0, limit).map((r) => toPublic(r.entry));
   }
 }
 
+function toPublic(entry: IndexedEntry): CatalogEntry {
+  return {
+    server: entry.server,
+    tool: entry.tool,
+    fqTool: entry.fqTool,
+    specifier: entry.specifier,
+    description: entry.description,
+    inputSchema: entry.inputSchema,
+    inputSchemaRaw: entry.inputSchemaRaw,
+    outputSchema: entry.outputSchema,
+  };
+}
+
 /**
- * Simple deterministic scoring.
+ * Simple deterministic scoring using precomputed lowercase fields.
  */
-function scoreEntry(entry: CatalogEntry, words: string[]): number {
+function scoreEntry(entry: IndexedEntry, words: string[]): number {
+  if (words.length === 0) return 0;
+
   let score = 0;
-
-  if (words.length === 0) return score;
-
-  const tool = entry.tool.toLowerCase();
-  const fqTool = entry.fqTool.toLowerCase();
-  const desc = entry.description?.toLowerCase() ?? '';
-
   for (const w of words) {
     if (!w) continue;
-    if (tool.includes(w)) score += 3;
-    if (fqTool.includes(w)) score += 2;
-    if (desc.includes(w)) score += 1;
+    if (entry.toolLower.includes(w)) score += 3;
+    if (entry.fqToolLower.includes(w)) score += 2;
+    if (entry.descLower.includes(w)) score += 1;
   }
 
   return score;
 }
-

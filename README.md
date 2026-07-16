@@ -17,10 +17,10 @@ Standard MCP integrations suffer from two bottlenecks:
 ```typescript
 // One execute_code call replaces multiple round-trips:
 import { readFile } from 'mcp/servers/filesystem/readFile';
-import { createOrUpdateFile } from 'mcp/servers/github-mcp-server/createOrUpdateFile';
+import { createEntities } from 'mcp/servers/memory/createEntities';
 
-const content = await readFile({ path: './data.json' });
-await createOrUpdateFile({ path: 'backup.json', content: JSON.stringify(content) });
+const content = await readFile({ path: '/abs/path/to/notes.json' });
+await createEntities({ entities: JSON.parse(/* ... */) });
 ```
 
 ## Architecture
@@ -43,32 +43,30 @@ graph TD
         mcp/servers/memory/..."]
 
         ExecMgr["Execution Manager
-        esbuild bundler
-        Worker thread
-        Job queue"]
+        worker pool
+        esbuild context + bundle cache
+        job queue"]
     end
 
     subgraph Downstream["Downstream MCP Servers"]
         FS["filesystem"]
-        EV["everything"]
         MEM["memory"]
-        GH["github-mcp-server"]
+        PW["playwright"]
     end
 
     LLM -- "stdio / MCP protocol" --> MetaTools
     MetaTools --> Wrappers
     MetaTools --> ExecMgr
     ExecMgr --> FS
-    ExecMgr --> EV
     ExecMgr --> MEM
-    ExecMgr --> GH
+    ExecMgr --> PW
 ```
 
 ## Getting Started
 
 ### Prerequisites
 
-- Node.js 20+
+- Node.js 20+ (use Node 22 if you also run [MCP Inspector](TESTING.md#2-launch-with-mcp-inspector))
 - npm
 
 ### Install
@@ -89,7 +87,7 @@ npm run build
 npm start
 ```
 
-The server communicates over **stdio** using the MCP protocol. Point any MCP-compatible client (Claude Desktop, Cursor, etc.) at the built binary.
+The server communicates over **stdio** using the MCP protocol. Point any MCP-compatible client (Claude Desktop, Cursor, etc.) at the built binary (`dist/index.js`).
 
 ### Development
 
@@ -97,34 +95,38 @@ The server communicates over **stdio** using the MCP protocol. Point any MCP-com
 # Run directly via ts-node (no build step)
 npm run dev
 
-# Keep esbuild bundle files on disk for inspection
-DEBUG_EXEC=1 npm start
+# Unit + hermetic integration tests
+npm test
+
+# Real end-to-end (boots proxy + downstream servers)
+npm run test:e2e
 ```
+
+See [TESTING.md](TESTING.md) for the full automated suite, CI notes, and the manual MCP Inspector checklist.
 
 ## Configuring Downstream Servers
 
-Edit `src/downstream/servers.ts` to add, remove, or change downstream MCP servers. Each entry has four fields:
+Edit [`src/downstream/servers.ts`](src/downstream/servers.ts) to add, remove, or change downstream MCP servers. Each entry has four fields:
 
-| Field     | Type                          | Description                                        |
-| --------- | ----------------------------- | -------------------------------------------------- |
-| `name`    | `string`                      | Stable identifier used to namespace tools           |
-| `command` | `string`                      | Executable to spawn (e.g. `npx`, `node`)           |
-| `args`    | `string[]`                    | Arguments passed to the command                     |
-| `env`     | `Record<string, string>` (opt) | Extra environment variables for the child process  |
+| Field     | Type                           | Description                                       |
+| --------- | ------------------------------ | ------------------------------------------------- |
+| `name`    | `string`                       | Stable identifier used to namespace tools        |
+| `command` | `string`                       | Executable to spawn (e.g. `npx`, `node`)          |
+| `args`    | `string[]`                     | Arguments passed to the command                   |
+| `env`     | `Record<string, string>` (opt) | Extra environment variables for the child process |
 
-The default configuration ships with four servers:
+The default configuration ships with three servers:
 
 ```typescript
 export const DOWNSTREAM_SERVERS: DownstreamServer[] = [
   {
     name: 'filesystem',
     command: 'npx',
-    args: ['-y', '@modelcontextprotocol/server-filesystem', process.cwd()],
-  },
-  {
-    name: 'everything',
-    command: 'npx',
-    args: ['-y', '@modelcontextprotocol/server-everything'],
+    args: [
+      '-y',
+      '@modelcontextprotocol/server-filesystem',
+      PROJECT_ROOT, // absolute repo root
+    ],
   },
   {
     name: 'memory',
@@ -132,19 +134,14 @@ export const DOWNSTREAM_SERVERS: DownstreamServer[] = [
     args: ['-y', '@modelcontextprotocol/server-memory'],
   },
   {
-    name: 'github-mcp-server',
+    name: 'playwright',
     command: 'npx',
-    args: [
-      '-y',
-      '--package=@0xshariq/github-mcp-server@latest',
-      '--', 'node', '--input-type=module',
-      '--eval', 'import("@0xshariq/github-mcp-server/dist/index.js")',
-    ],
+    args: ['-y', '@playwright/mcp@latest'],
   },
 ];
 ```
 
-After editing, rebuild and restart.
+After editing, rebuild and restart. First boot may need npm registry access because servers are started with `npx -y`.
 
 ## Meta-Tools Exposed to the LLM
 
@@ -152,41 +149,41 @@ WhiteNoise presents exactly four tools to the connected LLM client:
 
 ### `search_tools`
 
-Full-text search across every tool in the downstream catalog. Matches against tool name, fully-qualified name, and description with ranked scoring.
+Full-text search across every tool in the downstream catalog. Matches against tool name, fully-qualified name, and description with ranked scoring. Empty queries (and queries that score nothing) return a deterministic browse-style listing.
 
-| Parameter | Type     | Required | Default | Description                      |
-| --------- | -------- | -------- | ------- | -------------------------------- |
-| `query`   | `string` | yes      | --      | Search term                      |
-| `limit`   | `number` | no       | 20      | Maximum number of results        |
+| Parameter | Type     | Required | Default | Description               |
+| --------- | -------- | -------- | ------- | ------------------------- |
+| `query`   | `string` | yes      | --      | Search term               |
+| `limit`   | `number` | no       | 20      | Maximum number of results |
 
 ### `list_modules`
 
 Recursively lists the generated TypeScript wrapper files under the wrappers directory. Accepts an optional sub-path to narrow the listing.
 
-| Parameter | Type     | Required | Default | Description                         |
-| --------- | -------- | -------- | ------- | ----------------------------------- |
-| `path`    | `string` | no       | `""`    | Sub-path within the wrappers tree   |
+| Parameter | Type     | Required | Default | Description                       |
+| --------- | -------- | -------- | ------- | --------------------------------- |
+| `path`    | `string` | no       | `""`    | Sub-path within the wrappers tree |
 
 Returns module specifiers like `mcp/servers/filesystem/readFile` and `mcp/servers/filesystem/readFile.schema`.
 
 ### `read_module`
 
-Returns the full TypeScript source of a single wrapper module so the LLM can inspect the function signature, input types, and schema.
+Returns the full TypeScript source of a single wrapper module so the LLM can inspect the function signature, input types, field descriptions, and schema.
 
-| Parameter   | Type     | Required | Description                                  |
-| ----------- | -------- | -------- | -------------------------------------------- |
+| Parameter   | Type     | Required | Description                                               |
+| ----------- | -------- | -------- | --------------------------------------------------------- |
 | `specifier` | `string` | yes      | Module specifier (e.g. `mcp/servers/filesystem/readFile`) |
 
 ### `execute_code`
 
-Accepts a TypeScript snippet, bundles it with esbuild, and runs it in a sandboxed Worker thread. Any `mcp/*` imports are resolved to the generated wrappers, and tool calls inside the code are routed to the real downstream servers.
+Accepts a TypeScript snippet, bundles it with esbuild, and runs it in a Worker thread from a small pool. Any `mcp/*` imports are resolved to the generated wrappers, and tool calls inside the code are routed to the real downstream servers.
 
-| Parameter   | Type     | Required | Default | Description                        |
-| ----------- | -------- | -------- | ------- | ---------------------------------- |
-| `code`      | `string` | yes      | --      | TypeScript source to execute       |
-| `timeoutMs` | `number` | no       | 30000   | Per-execution timeout in ms        |
+| Parameter   | Type     | Required | Default | Description                 |
+| ----------- | -------- | -------- | ------- | --------------------------- |
+| `code`      | `string` | yes      | --      | TypeScript source to execute |
+| `timeoutMs` | `number` | no       | 30000   | Per-execution timeout in ms |
 
-Returns `{ durationMs, stdout, stderr }` on success.
+Returns `{ durationMs, stdout, stderr }` on success. Compile/runtime failures are returned as tool content (the proxy stays up).
 
 ## How Execution Works
 
@@ -195,17 +192,17 @@ sequenceDiagram
     participant LLM as LLM Client
     participant Proxy as Proxy Server
     participant Mgr as ExecutionManager
-    participant Worker as Worker Thread
+    participant Worker as Worker Pool
     participant DS as Downstream Server
 
     LLM->>Proxy: execute_code({ code, timeoutMs })
     Proxy->>Mgr: execute(code)
-    Mgr->>Mgr: Queue job, write entry.ts to .exec/uuid/
+    Mgr->>Mgr: Queue job, dispatch to idle worker
     Mgr->>Worker: postMessage({ type: run, script })
-    Worker->>Worker: esbuild bundle (resolve mcp/* imports)
+    Worker->>Worker: esbuild rebuild or cache hit
     Worker->>Worker: dynamic import(bundle.mjs)
 
-    Note over Worker,DS: Code calls a wrapper function (e.g. readFile)
+    Note over Worker,DS: Code calls a wrapper function e.g. readFile
 
     Worker->>Mgr: postMessage({ type: callTool, fqTool, args })
     Mgr->>DS: client.callTool({ name, arguments })
@@ -218,39 +215,43 @@ sequenceDiagram
 ```
 
 1. The LLM submits TypeScript code via `execute_code`.
-2. The code is written to an isolated temp directory (`.exec/<uuid>/entry.ts`).
-3. **esbuild** bundles it into a single ESM file. A custom plugin resolves all `mcp/*` imports to the generated wrapper files.
-4. The bundle is dynamically imported inside a **Node.js Worker thread**.
-5. When the code calls a wrapper function (e.g. `readFile()`), the wrapper invokes `globalThis.__callMCPTool`, which sends a message to the main thread.
-6. The main thread's `ExecutionManager` parses the fully-qualified tool name, looks up the correct downstream client in the `DownstreamPool`, and forwards the call.
-7. The downstream server's response flows back through the message channel to the worker, where the wrapper's promise resolves.
-8. Once the script finishes (or times out), stdout/stderr are captured and returned.
+2. The `ExecutionManager` queues the job and assigns it to an idle worker in the pool.
+3. The worker hashes the script (plus wrappers dir). On a cache miss it writes an entry file under `os.tmpdir()/meta-mcp-proxy/exec/`, rebuilds via a reused esbuild `context()`, and stores the bundle; on a hit it reuses the cached file.
+4. The bundle is dynamically imported inside the worker (unique query string so top-level code re-runs).
+5. When the code calls a wrapper (e.g. `readFile()`), the wrapper invokes `globalThis.__callMCPTool`, which messages the main thread.
+6. The main thread parses the fully-qualified tool name, looks up the client in `DownstreamPool`, and forwards the call.
+7. The downstream response flows back to the worker, where the wrapper's promise resolves.
+8. When the script finishes (or times out), stdout/stderr are captured and returned. Workers are recycled after a configurable number of runs to reclaim the ESM module cache.
 
 ### Execution Safeguards
 
-| Safeguard          | Value   | Description                                               |
-| ------------------ | ------- | --------------------------------------------------------- |
-| Soft timeout       | 30 s    | Configurable per call via `timeoutMs`                     |
-| Hard timeout       | 60 s    | Absolute ceiling enforced inside the worker               |
-| Queue depth        | 50      | Maximum pending executions before rejecting               |
-| Output cap         | 1 MB    | stdout and stderr are each truncated at 1 MB              |
-| Crash recovery     | auto    | Worker crashes trigger respawn and queue processing        |
+| Safeguard      | Value        | Description                                              |
+| -------------- | ------------ | -------------------------------------------------------- |
+| Soft timeout   | 30 s         | Configurable per call via `timeoutMs`                    |
+| Hard timeout   | 60 s         | Absolute ceiling enforced inside the worker              |
+| Worker pool    | up to 4      | Concurrent executions (sized from available parallelism) |
+| Queue depth    | 50           | Maximum pending executions before rejecting              |
+| Output cap     | 1 MB         | stdout and stderr are each truncated at 1 MB             |
+| Worker recycle | every 50 runs | Reclaims leaked ESM module entries                      |
+| Crash recovery | auto         | Worker crashes trigger respawn and queue processing      |
+
+Wrappers and exec sandboxes live under `os.tmpdir()/meta-mcp-proxy/` (not inside the repo), so the filesystem downstream server cannot see or mutate execution scratch files.
 
 ## Wrapper Generation
 
-At startup (and on hot reload), WhiteNoise queries every downstream server's tool list and generates two files per tool:
+At startup (and on hot reload), WhiteNoise queries every downstream server's tool list in parallel and generates two files per tool. Field descriptions and defaults from the raw JSON Schema are preserved as Zod `.describe()` / `.default()` calls; the tool description becomes JSDoc on the wrapper function.
 
-**`<toolName>.schema.ts`** -- the tool's input schema expressed as a Zod object:
+**`<toolName>.schema.ts`** -- input schema as Zod:
 
 ```typescript
 import { z } from 'zod';
 
 export const ReadFileSchema = z.object({
-  path: z.string(),
+  path: z.string().describe("Absolute path to the file to read"),
 });
 ```
 
-**`<toolName>.ts`** -- a typed async function that calls the bridge:
+**`<toolName>.ts`** -- typed async function that calls the bridge:
 
 ```typescript
 import { callMCPTool } from 'mcp/bridge/callMCPTool';
@@ -261,51 +262,68 @@ import type { MCPResult } from 'mcp/bridge/callMCPTool';
 export type ReadFileInput = z.infer<typeof ReadFileSchema>;
 export type ReadFileOutput = MCPResult;
 
+/** Read the contents of a file from disk */
 export async function readFile(input: ReadFileInput): Promise<ReadFileOutput> {
   return callMCPTool('filesystem__read_file', input);
 }
 ```
 
-The **bridge module** (`mcp/bridge/callMCPTool.ts`) delegates to `globalThis.__callMCPTool`, which is injected by the worker thread before the bundle runs.
+The **bridge module** (`mcp/bridge/callMCPTool.ts`) delegates to `globalThis.__callMCPTool`, which is injected by the worker before the bundle runs.
+
+JSON Schema conversion covers common MCP patterns including `anyOf` / `oneOf` / `allOf`, local `$ref`, `additionalProperties`, and string/number constraints. Generation prefers emitting Zod source directly from JSON Schema rather than reflecting Zod internals.
 
 ## Hot Reload
 
 ```mermaid
 flowchart TD
     A["Downstream server disconnects"] --> B["DownstreamPool detects failure"]
-    B --> C["Fire onChange callbacks"]
+    B --> C["Notify onChange single-flight"]
     C --> D["Attempt reconnect
     exponential backoff: 1s, 2s, 3s, 4s, 5s"]
-    D -->|Success| E["ToolCatalog.refresh()
-    re-query all servers"]
+    D -->|Success| E["ToolCatalog.refresh
+    parallel listTools allSettled"]
     D -->|All 5 attempts fail| F["Give up on server"]
-    E --> G["regenerateWrappers()
-    regenerate TypeScript files"]
-    G --> H["Pending & future executions
-    use refreshed wrappers"]
+    E --> G["regenerateWrappers"]
+    G --> H["Future executions use refreshed wrappers"]
 ```
 
 When a downstream server disconnects:
 
-1. The `DownstreamPool` detects the broken connection and fires `onChange` callbacks.
-2. Reconnection is attempted with exponential backoff (1 s, 2 s, 3 s, 4 s, 5 s -- up to 5 attempts).
-3. On successful reconnect, the `ToolCatalog` re-queries all servers and the wrapper files are regenerated.
-4. Pending and future executions automatically pick up the refreshed wrappers.
+1. The `DownstreamPool` detects the broken connection and fires `onChange` callbacks (async errors are contained).
+2. Reconnection is attempted with exponential backoff (1 s … 5 s, up to 5 attempts).
+3. Catalog refresh + wrapper regenerate are serialized behind a single-flight lock (latest-wins) so concurrent disconnects cannot corrupt the wrappers tree.
+4. A single failing `listTools` does not abort refresh — that server is skipped and the rest of the catalog still loads.
+5. Future executions pick up the refreshed wrappers.
+
+Stray `uncaughtException` / `unhandledRejection` events are logged without taking down the proxy; only `SIGINT` / `SIGTERM` trigger a clean shutdown.
+
+## Testing
+
+| Command              | What it runs                                      |
+| -------------------- | ------------------------------------------------- |
+| `npm test`           | Unit + hermetic integration (Vitest)              |
+| `npm run test:unit`  | Unit tests only (`src/` imports)                  |
+| `npm run test:e2e`   | Real stdio proxy + downstream servers (`RUN_E2E`) |
+| `npm run test:watch` | Vitest watch mode                                 |
+| `npm run test:coverage` | Coverage over `src/`                           |
+
+CI (`.github/workflows/ci.yml`) runs unit/integration on every push/PR and a separate e2e job with network access for `npx` downstream packages.
+
+Full details, including the MCP Inspector manual checklist: **[TESTING.md](TESTING.md)**.
 
 ## Project Structure
 
 ```
 src/
-  index.ts                        Entry point -- boots pool, catalog, wrappers,
-                                  execution manager, and MCP server
+  index.ts                        Entry point — pool, catalog, wrappers,
+                                  execution manager, MCP server, hot reload
 
   downstream/
     servers.ts                    Downstream server configuration (data only)
-    pool.ts                       Connection pool with auto-restart on failure
+    pool.ts                       Connection pool with auto-restart
     catalog.ts                    Aggregated tool catalog with search scoring
     names.ts                      Fully-qualified tool name helpers
-                                  (e.g. filesystem__read_file)
-    schemaConverter.ts            JSON Schema <-> Zod bidirectional converter
+    schemaConverter.ts            JSON Schema → Zod (runtime + source emit)
 
   proxy/
     server.ts                     MCP server exposing the four meta-tools
@@ -318,22 +336,29 @@ src/
     modules.ts                    list_modules / read_module implementations
 
   exec/
-    manager.ts                    Job queue, timeout enforcement, worker management
-    worker.ts                     Sandboxed execution inside a Worker thread
-    protocol.ts                   Main <-> Worker message type definitions
-    esbuildPlugin.ts              Custom esbuild plugin resolving mcp/* imports
+    manager.ts                    Worker pool, job queue, timeouts, recycle
+    worker.ts                     esbuild context, bundle cache, sandbox import
+    protocol.ts                   Main ↔ Worker message types
+    esbuildPlugin.ts              Resolves mcp/* imports
+
+test/
+  unit/                           Fast tests against src/
+  integration/                    Hermetic tests against dist/ + fake pool
+  e2e/                            Gated real-proxy stdio tests
+  helpers/                        Fake pool, fixtures, build globalSetup
 ```
 
 ## Dependencies
 
-| Package                                    | Purpose                                    |
-| ------------------------------------------ | ------------------------------------------ |
-| `@modelcontextprotocol/sdk`                | MCP client and server SDK                  |
-| `@modelcontextprotocol/server-filesystem`  | Built-in filesystem MCP server             |
-| `@0xshariq/github-mcp-server`             | GitHub MCP server                          |
-| `zod`                                      | Runtime schema validation and code generation |
-| `esbuild`                                  | Bundling user-submitted TypeScript          |
-| `typescript`                               | Type checking and compilation              |
+| Package                                   | Purpose                                      |
+| ----------------------------------------- | -------------------------------------------- |
+| `@modelcontextprotocol/sdk`               | MCP client and server SDK                    |
+| `@modelcontextprotocol/server-filesystem` | Filesystem MCP server                        |
+| `@playwright/mcp`                         | Playwright MCP server                        |
+| `zod`                                     | Schema validation and wrapper code generation |
+| `esbuild`                                 | Bundling user-submitted TypeScript           |
+| `typescript`                              | Type checking and compilation                |
+| `vitest`                                  | Test runner (dev)                            |
 
 ## License
 

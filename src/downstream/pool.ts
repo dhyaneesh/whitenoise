@@ -28,19 +28,20 @@ function buildChildEnv(extra?: Record<string, string>): Record<string, string> {
 
 export class DownstreamPool {
   private servers = new Map<string, ServerState>();
-  private onChangeCallbacks: Array<() => void> = [];
+  private onChangeCallbacks: Array<() => void | Promise<void>> = [];
 
-  onChange(cb: () => void): void {
+  onChange(cb: () => void | Promise<void>): void {
     this.onChangeCallbacks.push(cb);
   }
 
   private notifyChange(): void {
     for (const cb of this.onChangeCallbacks) {
-      try {
-        cb();
-      } catch (err) {
-        console.error('[downstream] onChange error', err);
-      }
+      // Fire async callbacks without blocking reconnect; contain rejections
+      Promise.resolve()
+        .then(() => cb())
+        .catch((err) => {
+          console.error('[downstream] onChange error', err);
+        });
     }
   }
 
@@ -50,7 +51,7 @@ export class DownstreamPool {
 
   async startAll(): Promise<void> {
     const results = await Promise.allSettled(
-      DOWNSTREAM_SERVERS.map(s => this.startServer(s))
+      DOWNSTREAM_SERVERS.map((s) => this.startServer(s))
     );
     for (const r of results) {
       if (r.status === 'rejected') {
@@ -82,24 +83,24 @@ export class DownstreamPool {
 
     const client = new Client({
       name: 'meta-mcp-proxy',
-      version: '0.1.0'
+      version: '0.1.0',
     });
 
     const transport = new StdioClientTransport({
       command: config.command,
       args: config.args,
-      env: buildChildEnv(config.env)
+      env: buildChildEnv(config.env),
     });
 
     // Hook disconnect detection
     transport.onclose = () => {
       console.warn('[downstream] disconnected:', config.name);
-      this.handleServerFailure(config.name);
+      void this.handleServerFailure(config.name);
     };
 
     transport.onerror = (err: Error) => {
       console.error('[downstream] error:', config.name, err);
-      this.handleServerFailure(config.name);
+      void this.handleServerFailure(config.name);
     };
 
     await client.connect(transport);
@@ -130,7 +131,7 @@ export class DownstreamPool {
     // Exponential backoff: 1s, 2s, 3s, 4s, 5s
     for (let attempt = 1; attempt <= 5; attempt++) {
       try {
-        await new Promise(r => setTimeout(r, attempt * 1000));
+        await new Promise((r) => setTimeout(r, attempt * 1000));
         await this.startServer(state.config);
         console.error('[downstream] reconnected:', name);
         this.notifyChange();

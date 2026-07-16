@@ -5,10 +5,43 @@ import { ToolCatalog } from './downstream/catalog.js';
 import { prepareWrappers, regenerateWrappers, wrappersDir } from './wrappers/manager.js';
 import { ExecutionManager } from './exec/manager.js';
 
+/**
+ * Serialize async work so concurrent triggers collapse into at most one
+ * in-flight run plus one queued follow-up (latest-wins).
+ */
+function createSingleFlight(label: string) {
+  let inflight: Promise<void> | null = null;
+  let pending = false;
+
+  return (work: () => Promise<void>) => {
+    if (inflight) {
+      pending = true;
+      return;
+    }
+
+    const run = async () => {
+      do {
+        pending = false;
+        try {
+          await work();
+        } catch (err) {
+          console.error(`[proxy] ${label} failed:`, err);
+        }
+      } while (pending);
+      inflight = null;
+    };
+
+    inflight = run();
+  };
+}
+
 function installShutdownHandlers(cleanup: () => Promise<void>) {
-  const shutdown = async (signal: string, err?: unknown) => {
+  let shuttingDown = false;
+
+  const shutdown = async (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     console.error('[proxy] shutting down:', signal);
-    if (err) console.error(err);
     try {
       await cleanup();
     } finally {
@@ -16,10 +49,16 @@ function installShutdownHandlers(cleanup: () => Promise<void>) {
     }
   };
 
-  process.on('SIGINT', () => shutdown('SIGINT'));
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
-  process.on('uncaughtException', (err) => shutdown('uncaughtException', err));
-  process.on('unhandledRejection', (err) => shutdown('unhandledRejection', err));
+  process.on('SIGINT', () => void shutdown('SIGINT'));
+  process.on('SIGTERM', () => void shutdown('SIGTERM'));
+
+  // Contain stray errors — do not take down the whole proxy
+  process.on('uncaughtException', (err) => {
+    console.error('[proxy] uncaughtException (contained):', err);
+  });
+  process.on('unhandledRejection', (reason) => {
+    console.error('[proxy] unhandledRejection (contained):', reason);
+  });
 }
 
 async function main() {
@@ -27,23 +66,23 @@ async function main() {
 
   const pool = new DownstreamPool();
   await pool.startAll();
-  console.error('[proxy] all downstream servers connected');
+  console.error('[proxy] downstream servers connected');
 
   const catalog = new ToolCatalog(pool);
   await catalog.refresh();
 
   await prepareWrappers(catalog);
 
+  const refreshCatalogAndWrappers = createSingleFlight('catalog refresh');
+
   // Hot reload: refresh catalog and wrappers when downstream servers change
-  pool.onChange(async () => {
+  pool.onChange(() => {
     console.error('[proxy] downstream change detected, refreshing catalog');
-    try {
+    refreshCatalogAndWrappers(async () => {
       await catalog.refresh();
       await regenerateWrappers(catalog);
       console.error('[proxy] catalog and wrappers refreshed');
-    } catch (err) {
-      console.error('[proxy] refresh failed:', err);
-    }
+    });
   });
 
   const execMgr = new ExecutionManager(pool, wrappersDir);
@@ -52,10 +91,9 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
-  // Install shutdown handlers with cleanup
   async function cleanup() {
-    await execMgr?.shutdown();
-    await pool?.stopAll();
+    await execMgr.shutdown();
+    await pool.stopAll();
   }
 
   installShutdownHandlers(cleanup);

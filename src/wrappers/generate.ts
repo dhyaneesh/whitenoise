@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { mkdir, writeFile } from 'node:fs/promises';
 import type { ToolCatalog, CatalogEntry } from '../downstream/catalog.js';
-import { zodToSource } from '../downstream/schemaConverter.js';
+import { jsonSchemaToSource } from '../downstream/schemaConverter.js';
 import { toCamelCase } from '../downstream/names.js';
 
 function toPascalCase(name: string): string {
@@ -9,6 +9,15 @@ function toPascalCase(name: string): string {
     .split(/[_-]/)
     .map(part => part.charAt(0).toUpperCase() + part.slice(1))
     .join('');
+}
+
+function jsDocBlock(description?: string): string {
+  if (!description) return '';
+  const lines = description.trim().split(/\r?\n/);
+  if (lines.length === 1) {
+    return `/** ${lines[0]} */\n`;
+  }
+  return `/**\n${lines.map((l) => ` * ${l}`).join('\n')}\n */\n`;
 }
 
 export async function generateWrappers(
@@ -25,12 +34,20 @@ export async function generateWrappers(
     'utf8'
   );
 
-  // 2. Per-tool wrappers (sorted for deterministic output)
-  for (const entry of catalog.listAll().sort((a, b) =>
+  // 2. Per-tool wrappers (sorted for deterministic output) — write in parallel
+  const entries = catalog.listAll().sort((a, b) =>
     a.fqTool.localeCompare(b.fqTool)
-  )) {
-    await writeToolWrapper(wrappersDir, entry);
-  }
+  );
+
+  // Pre-create server dirs so parallel writes don't race on mkdir
+  const servers = [...new Set(entries.map((e) => e.server))];
+  await Promise.all(
+    servers.map((server) =>
+      mkdir(path.join(wrappersDir, 'servers', server), { recursive: true })
+    )
+  );
+
+  await Promise.all(entries.map((entry) => writeToolWrapper(wrappersDir, entry)));
 }
 
 async function writeToolWrapper(
@@ -39,14 +56,14 @@ async function writeToolWrapper(
 ): Promise<void> {
   const toolFn = toCamelCase(entry.tool);
   const schemaName = toPascalCase(entry.tool) + 'Schema';
+  const pascal = toPascalCase(entry.tool);
 
   const serverDir = path.join(wrappersDir, 'servers', entry.server);
-  await mkdir(serverDir, { recursive: true });
 
-  // Generate schema file
+  // Generate schema file from raw JSON Schema (preserves descriptions/defaults)
   const schemaFilePath = path.join(serverDir, `${toolFn}.schema.ts`);
-  const schemaSourceCode = entry.inputSchema
-    ? zodToSource(entry.inputSchema)
+  const schemaSourceCode = entry.inputSchemaRaw
+    ? jsonSchemaToSource(entry.inputSchemaRaw)
     : 'z.unknown()';
 
   const schemaSource = `import { z } from 'zod';
@@ -54,27 +71,29 @@ async function writeToolWrapper(
 export const ${schemaName} = ${schemaSourceCode};
 `;
 
-  await writeFile(schemaFilePath, schemaSource, 'utf8');
-
-  // Generate typed wrapper file
+  // Generate typed wrapper file with JSDoc from tool description
   const wrapperFilePath = path.join(serverDir, `${toolFn}.ts`);
+  const doc = jsDocBlock(entry.description);
 
   const wrapperSource = `import { callMCPTool } from 'mcp/bridge/callMCPTool';
 import type { z } from 'zod';
 import { ${schemaName} } from './${toolFn}.schema';
 import type { MCPResult } from 'mcp/bridge/callMCPTool';
 
-export type ${toPascalCase(entry.tool)}Input = z.infer<typeof ${schemaName}>;
-export type ${toPascalCase(entry.tool)}Output = MCPResult;
+export type ${pascal}Input = z.infer<typeof ${schemaName}>;
+export type ${pascal}Output = MCPResult;
 
-export async function ${toolFn}(
-  input: ${toPascalCase(entry.tool)}Input
-): Promise<${toPascalCase(entry.tool)}Output> {
+${doc}export async function ${toolFn}(
+  input: ${pascal}Input
+): Promise<${pascal}Output> {
   return callMCPTool('${entry.fqTool}', input);
 }
 `;
 
-  await writeFile(wrapperFilePath, wrapperSource, 'utf8');
+  await Promise.all([
+    writeFile(schemaFilePath, schemaSource, 'utf8'),
+    writeFile(wrapperFilePath, wrapperSource, 'utf8'),
+  ]);
 }
 
 const BRIDGE_SOURCE = `/**

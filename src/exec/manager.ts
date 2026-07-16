@@ -3,6 +3,7 @@ import { Worker } from 'node:worker_threads';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
+import { availableParallelism } from 'node:os';
 import type { WorkerToMain, MainToWorker, CallToolMessage } from './protocol.js';
 import { parseFqTool } from '../downstream/names.js';
 import type { DownstreamPool } from '../downstream/pool.js';
@@ -13,6 +14,16 @@ const __dirname = path.dirname(__filename);
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_QUEUE_LENGTH = 50;
 const MAX_OUTPUT_BYTES = 1024 * 1024; // 1MB cap
+/** Recycle a worker after this many runs to reclaim the ESM module cache */
+const MAX_RUNS_PER_WORKER = 50;
+
+function defaultPoolSize(): number {
+  try {
+    return Math.min(4, Math.max(1, availableParallelism()));
+  } catch {
+    return 2;
+  }
+}
 
 export class ExecutionTimeoutError extends Error {
   constructor(runId: string) {
@@ -50,23 +61,47 @@ type ActiveRun = {
   stderr: string;
 };
 
+type WorkerSlot = {
+  id: string;
+  worker: Worker;
+  activeRun: ActiveRun | null;
+  runCount: number;
+  /** True while this slot is being replaced; ignore its exit handler respawn */
+  retiring: boolean;
+};
+
 export class ExecutionManager {
-  private worker: Worker | null = null;
-  private activeRun: ActiveRun | null = null;
+  private slots: WorkerSlot[] = [];
   private queue: QueuedJob[] = [];
-  private inFlightToolCalls = new Map<string, { runId: string }>();
+  private inFlightToolCalls = new Map<
+    string,
+    { runId: string; slotId: string }
+  >();
+  private readonly poolSize: number;
+  private readonly maxRunsPerWorker: number;
+  private shuttingDown = false;
 
   constructor(
-    private pool: DownstreamPool,
-    private wrappersDir: string
+    private downstream: DownstreamPool,
+    private wrappersDir: string,
+    options: { poolSize?: number; maxRunsPerWorker?: number } = {}
   ) {
-    this.spawnWorker();
+    this.poolSize = options.poolSize ?? defaultPoolSize();
+    this.maxRunsPerWorker = options.maxRunsPerWorker ?? MAX_RUNS_PER_WORKER;
+    for (let i = 0; i < this.poolSize; i++) {
+      this.slots.push(this.createSlot());
+    }
+    console.error(`[exec] worker pool size: ${this.poolSize}`);
   }
 
   async execute(
     script: string,
     options: { timeoutMs?: number } = {}
   ): Promise<{ durationMs: number; stdout: string; stderr: string }> {
+    if (this.shuttingDown) {
+      throw new Error('Proxy shutting down');
+    }
+
     if (this.queue.length >= MAX_QUEUE_LENGTH) {
       throw new QueueFullError();
     }
@@ -78,47 +113,51 @@ export class ExecutionManager {
         reject,
         timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
       });
-
-      if (!this.activeRun) {
-        this.startNext();
-      }
+      this.pump();
     });
   }
 
   async shutdown(): Promise<void> {
-    if (this.worker) {
-      await this.worker.terminate();
-      this.worker = null;
-    }
-
-    if (this.activeRun) {
-      clearTimeout(this.activeRun.timer);
-      this.activeRun.job.reject(new Error('Proxy shutting down'));
-      this.activeRun = null;
-    }
+    this.shuttingDown = true;
 
     for (const job of this.queue) {
       job.reject(new Error('Proxy shutting down'));
     }
     this.queue = [];
+
+    for (const slot of this.slots) {
+      slot.retiring = true;
+      if (slot.activeRun) {
+        clearTimeout(slot.activeRun.timer);
+        slot.activeRun.job.reject(new Error('Proxy shutting down'));
+        slot.activeRun = null;
+      }
+      await slot.worker.terminate().catch(() => {});
+    }
+    this.slots = [];
   }
 
-  private startNext(): void {
-    const job = this.queue.shift();
-    if (!job || !this.worker) return;
+  /** Dispatch queued jobs to any idle workers */
+  private pump(): void {
+    if (this.shuttingDown) return;
 
-    // Sanity check: should never have active run when starting next
-    if (this.activeRun && this.queue.length > 0) {
-      console.warn('[exec] invariant violation: active + queued');
+    while (this.queue.length > 0) {
+      const slot = this.slots.find((s) => !s.retiring && !s.activeRun);
+      if (!slot) break;
+
+      const job = this.queue.shift()!;
+      this.startOnSlot(slot, job);
     }
+  }
 
+  private startOnSlot(slot: WorkerSlot, job: QueuedJob): void {
     const runId = randomUUID();
 
     const timer = setTimeout(() => {
-      this.handleTimeout(runId);
+      this.handleTimeout(slot, runId);
     }, job.timeoutMs);
 
-    this.activeRun = {
+    slot.activeRun = {
       id: runId,
       job,
       timer,
@@ -126,7 +165,7 @@ export class ExecutionManager {
       stderr: '',
     };
 
-    this.worker.postMessage({
+    slot.worker.postMessage({
       type: 'run',
       id: runId,
       payload: {
@@ -136,32 +175,35 @@ export class ExecutionManager {
     } satisfies MainToWorker);
   }
 
-  private handleTimeout(runId: string): void {
-    if (!this.activeRun || this.activeRun.id !== runId) return;
+  private handleTimeout(slot: WorkerSlot, runId: string): void {
+    if (!slot.activeRun || slot.activeRun.id !== runId) return;
 
-    const job = this.activeRun.job;
-    this.activeRun = null;
+    const job = slot.activeRun.job;
+    slot.activeRun = null;
 
-    // Reject all in-flight tool calls for this run
-    this.rejectInFlightToolCalls(runId, new ExecutionTimeoutError(runId));
+    this.rejectInFlightToolCalls(runId);
 
-    // Terminate and respawn worker
-    this.worker?.terminate();
-    this.spawnWorker();
+    // Kill and replace this slot — timeout may leave the worker hung
+    this.replaceSlot(slot);
 
     job.reject(new ExecutionTimeoutError(runId));
-    this.startNext();
+    this.pump();
   }
 
-  private async handleToolCall(msg: CallToolMessage): Promise<void> {
-    if (!this.worker) return;
-    if (!this.activeRun) return;
+  private async handleToolCall(
+    slot: WorkerSlot,
+    msg: CallToolMessage
+  ): Promise<void> {
+    if (!slot.activeRun) return;
 
     const { server, tool } = parseFqTool(msg.payload.fqTool);
-    this.inFlightToolCalls.set(msg.id, { runId: this.activeRun.id });
+    this.inFlightToolCalls.set(msg.id, {
+      runId: slot.activeRun.id,
+      slotId: slot.id,
+    });
 
     try {
-      const client = this.pool.getClient(server);
+      const client = this.downstream.getClient(server);
       const result = await client.callTool({
         name: tool,
         arguments: msg.payload.args as Record<string, unknown> | undefined,
@@ -169,7 +211,9 @@ export class ExecutionManager {
 
       this.inFlightToolCalls.delete(msg.id);
 
-      this.worker?.postMessage({
+      if (slot.retiring || !slot.activeRun) return;
+
+      slot.worker.postMessage({
         type: 'callToolResult',
         id: msg.id,
         payload: { ok: true, result },
@@ -178,7 +222,9 @@ export class ExecutionManager {
       console.error('[downstream]', server, 'tool failed', err);
       this.inFlightToolCalls.delete(msg.id);
 
-      this.worker?.postMessage({
+      if (slot.retiring || !slot.activeRun) return;
+
+      slot.worker.postMessage({
         type: 'callToolResult',
         id: msg.id,
         payload: {
@@ -189,19 +235,24 @@ export class ExecutionManager {
     }
   }
 
-  private handleRunResult(msg: WorkerToMain & { type: 'runResult' }): void {
-    if (!this.worker) return;
-    if (!this.activeRun || this.activeRun.id !== msg.id) return;
+  private handleRunResult(
+    slot: WorkerSlot,
+    msg: WorkerToMain & { type: 'runResult' }
+  ): void {
+    if (!slot.activeRun || slot.activeRun.id !== msg.id) return;
 
-    clearTimeout(this.activeRun.timer);
-    const { job, stdout, stderr } = this.activeRun;
-    this.activeRun = null;
+    clearTimeout(slot.activeRun.timer);
+    const { job, stdout, stderr } = slot.activeRun;
+    slot.activeRun = null;
+    slot.runCount += 1;
 
     if (msg.payload.ok) {
       console.error('[exec] run complete', {
+        slot: slot.id,
         durationMs: msg.payload.durationMs,
         stdoutBytes: stdout.length,
         stderrBytes: stderr.length,
+        runCount: slot.runCount,
       });
       job.resolve({ durationMs: msg.payload.durationMs, stdout, stderr });
     } else {
@@ -210,52 +261,68 @@ export class ExecutionManager {
       job.reject(err);
     }
 
-    this.startNext();
+    // Recycle after N runs to reclaim leaked ESM module cache
+    if (slot.runCount >= this.maxRunsPerWorker && !slot.retiring) {
+      console.error(
+        `[exec] recycling worker ${slot.id} after ${slot.runCount} runs`
+      );
+      this.replaceSlot(slot);
+    }
+
+    this.pump();
   }
 
-  private rejectInFlightToolCalls(runId: string, error: Error): void {
+  private rejectInFlightToolCalls(runId: string): void {
     for (const [callId, info] of this.inFlightToolCalls) {
       if (info.runId === runId) {
         this.inFlightToolCalls.delete(callId);
-        // Tool call promises in worker will be rejected when worker crashes
       }
     }
   }
 
-  private handleWorkerError(error: Error): void {
-    console.error('[exec] worker error:', error);
+  private handleWorkerError(slot: WorkerSlot, error: Error): void {
+    if (slot.retiring) return;
+    console.error('[exec] worker error:', slot.id, error);
 
-    if (this.activeRun) {
-      clearTimeout(this.activeRun.timer);
-      this.activeRun.job.reject(new WorkerCrashedError(error.message));
-      this.rejectInFlightToolCalls(this.activeRun.id, error);
-      this.activeRun = null;
+    if (slot.activeRun) {
+      clearTimeout(slot.activeRun.timer);
+      slot.activeRun.job.reject(new WorkerCrashedError(error.message));
+      this.rejectInFlightToolCalls(slot.activeRun.id);
+      slot.activeRun = null;
     }
 
-    this.spawnWorker();
-    this.startNext();
+    this.replaceSlot(slot);
+    this.pump();
   }
 
-  private handleWorkerExit(code: number): void {
+  private handleWorkerExit(slot: WorkerSlot, code: number): void {
+    if (slot.retiring) return;
+
     if (code !== 0) {
-      console.error(`[exec] worker exited with code ${code}`);
+      console.error(`[exec] worker ${slot.id} exited with code ${code}`);
     }
 
-    if (this.activeRun) {
-      clearTimeout(this.activeRun.timer);
-      this.activeRun.job.reject(new WorkerCrashedError(`Worker exited with code ${code}`));
-      this.rejectInFlightToolCalls(this.activeRun.id, new Error('Worker exited'));
-      this.activeRun = null;
+    if (slot.activeRun) {
+      clearTimeout(slot.activeRun.timer);
+      slot.activeRun.job.reject(
+        new WorkerCrashedError(`Worker exited with code ${code}`)
+      );
+      this.rejectInFlightToolCalls(slot.activeRun.id);
+      slot.activeRun = null;
     }
 
-    this.spawnWorker();
-    this.startNext();
+    this.replaceSlot(slot);
+    this.pump();
   }
 
-  private appendOutput(stream: 'stdout' | 'stderr', chunk: Buffer): void {
-    if (!this.activeRun) return;
+  private appendOutput(
+    slot: WorkerSlot,
+    stream: 'stdout' | 'stderr',
+    chunk: Buffer
+  ): void {
+    if (!slot.activeRun) return;
 
-    const current = this.activeRun[stream];
+    const current = slot.activeRun[stream];
     if (current.length >= MAX_OUTPUT_BYTES) return;
 
     let text = chunk.toString('utf8');
@@ -265,34 +332,56 @@ export class ExecutionManager {
       text = text.slice(0, remaining) + '\n[output truncated]';
     }
 
-    this.activeRun[stream] += text;
+    slot.activeRun[stream] += text;
   }
 
-  private spawnWorker(): void {
+  private replaceSlot(oldSlot: WorkerSlot): void {
+    oldSlot.retiring = true;
+    void oldSlot.worker.terminate().catch(() => {});
+
+    const idx = this.slots.indexOf(oldSlot);
+    if (idx === -1 || this.shuttingDown) return;
+
+    const fresh = this.createSlot();
+    this.slots[idx] = fresh;
+  }
+
+  private createSlot(): WorkerSlot {
+    const id = randomUUID().slice(0, 8);
     const workerPath = path.join(__dirname, 'worker.js');
 
-    this.worker = new Worker(workerPath, {
+    const worker = new Worker(workerPath, {
       stdout: true,
       stderr: true,
     });
 
-    this.worker.stdout?.on('data', (chunk: Buffer) => {
-      this.appendOutput('stdout', chunk);
+    const slot: WorkerSlot = {
+      id,
+      worker,
+      activeRun: null,
+      runCount: 0,
+      retiring: false,
+    };
+
+    worker.stdout?.on('data', (chunk: Buffer) => {
+      this.appendOutput(slot, 'stdout', chunk);
     });
 
-    this.worker.stderr?.on('data', (chunk: Buffer) => {
-      this.appendOutput('stderr', chunk);
+    worker.stderr?.on('data', (chunk: Buffer) => {
+      this.appendOutput(slot, 'stderr', chunk);
     });
 
-    this.worker.on('message', (msg: WorkerToMain) => {
+    worker.on('message', (msg: WorkerToMain) => {
       if (msg.type === 'callTool') {
-        this.handleToolCall(msg);
+        void this.handleToolCall(slot, msg);
       } else if (msg.type === 'runResult') {
-        this.handleRunResult(msg);
+        this.handleRunResult(slot, msg);
       }
     });
 
-    this.worker.on('error', (err) => this.handleWorkerError(err));
-    this.worker.on('exit', (code) => this.handleWorkerExit(code ?? 1));
+    worker.on('error', (err) => this.handleWorkerError(slot, err));
+    worker.on('exit', (code) => this.handleWorkerExit(slot, code ?? 1));
+
+    return slot;
   }
 }
