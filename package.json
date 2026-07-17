@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && cp src/downstream/servers.json dist/downstream/servers.json",
     "start": "node --import ./dist/telemetry/instrumentation.js dist/index.js",
     "dev": "npm run build && node --import ./dist/telemetry/instrumentation.js dist/index.js",
     "test": "vitest run --project unit --project integration",

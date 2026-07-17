@@ -58,9 +58,8 @@ describe.skipIf(!runE2E)('proxy e2e (stdio + real downstream)', () => {
     });
     const text = textContent(result as any);
     const modules = JSON.parse(text) as string[];
+    expect(modules.length).toBeGreaterThan(0);
     expect(modules.some((m) => m.includes('filesystem'))).toBe(true);
-    expect(modules.some((m) => m.includes('memory'))).toBe(true);
-    expect(modules.some((m) => m.includes('playwright'))).toBe(true);
   });
 
   it('search_tools finds filesystem tools', async () => {

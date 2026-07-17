@@ -1,0 +1,24 @@
+{
+  "servers": [
+    {
+      "name": "filesystem",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "$PROJECT_ROOT"]
+    },
+    {
+      "name": "sequentialThinking",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"]
+    },
+    {
+      "name": "chromeDevtools",
+      "command": "npx",
+      "args": ["-y", "chrome-devtools-mcp"]
+    },
+    {
+      "name": "context7",
+      "command": "npx",
+      "args": ["-y", "@upstash/context7-mcp"]
+    }
+  ]
+}
