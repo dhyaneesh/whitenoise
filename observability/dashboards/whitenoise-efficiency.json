@@ -1,0 +1,63 @@
+{
+  "title": "WhiteNoise Efficiency",
+  "description": "Context and composition value: discovery bytes, round trips avoided, cache hits, search fallback.",
+  "panels": [
+    {
+      "title": "Downstream tools per execution",
+      "query": "histogram_quantile(0.50, sum(rate(whitenoise_execution_tool_calls_bucket[5m])) by (le))",
+      "type": "timeseries"
+    },
+    {
+      "title": "Estimated round trips avoided",
+      "query": "histogram_quantile(0.50, sum(rate(whitenoise_execution_round_trips_avoided_bucket[5m])) by (le))",
+      "type": "timeseries"
+    },
+    {
+      "title": "Discovery bytes by meta-tool",
+      "query": "histogram_quantile(0.50, sum(rate(whitenoise_context_discovery_bytes_bucket[5m])) by (le, meta_tool))",
+      "type": "timeseries",
+      "notes": "Per-call only — do not sum across search/read/execute without an external harness"
+    },
+    {
+      "title": "Modules read",
+      "query": "rate(whitenoise_context_modules_read_total[5m])",
+      "type": "timeseries"
+    },
+    {
+      "title": "Bundle cache hit vs miss",
+      "queries": [
+        "rate(whitenoise_bundle_cache_hit_total[5m])",
+        "rate(whitenoise_bundle_cache_miss_total[5m])"
+      ],
+      "type": "timeseries"
+    },
+    {
+      "title": "Search duration (fallback dimension)",
+      "query": "histogram_quantile(0.95, sum(rate(whitenoise_search_duration_bucket[5m])) by (le, fallback))",
+      "type": "timeseries"
+    },
+    {
+      "title": "Zero-match search rate",
+      "query": "rate(whitenoise_search_zero_match_count_total[5m])",
+      "type": "timeseries"
+    },
+    {
+      "title": "Compilation / runtime error share",
+      "query": "sum(rate(whitenoise_execution_count_total{outcome=~\"compilation_error|runtime_error|module_not_found\"}[5m])) / sum(rate(whitenoise_execution_count_total[5m]))",
+      "type": "timeseries"
+    },
+    {
+      "title": "Wrappers generated",
+      "query": "rate(whitenoise_wrapper_generated_count_total[5m])",
+      "type": "timeseries"
+    }
+  ],
+  "alerts": [
+    "More than 20% of searches use zero-match fallback",
+    "Compilation-error percentage above baseline"
+  ],
+  "baselineComparators": {
+    "catalog_definition_bytes": "Read from span attribute whitenoise.catalog.definition_bytes on whitenoise.catalog.refresh",
+    "catalog_tool_count": "Read from span attribute whitenoise.catalog.tool_count"
+  }
+}

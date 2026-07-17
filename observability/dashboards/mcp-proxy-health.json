@@ -1,0 +1,68 @@
+{
+  "title": "MCP Proxy Health",
+  "description": "WhiteNoise execution health: latency, queue, workers, timeouts, truncations.",
+  "panels": [
+    {
+      "title": "Executions per minute",
+      "query": "rate(whitenoise_execution_count_total[1m])",
+      "type": "timeseries"
+    },
+    {
+      "title": "Execution error rate",
+      "query": "sum(rate(whitenoise_execution_count_total{outcome!=\"success\"}[5m])) / sum(rate(whitenoise_execution_count_total[5m]))",
+      "type": "timeseries"
+    },
+    {
+      "title": "P50/P95/P99 execution latency",
+      "query": "histogram_quantile(0.95, sum(rate(whitenoise_execution_duration_bucket[5m])) by (le))",
+      "type": "timeseries",
+      "notes": "Also chart p50 and p99 with the same metric"
+    },
+    {
+      "title": "Queue depth",
+      "query": "whitenoise_execution_queue_depth",
+      "type": "timeseries"
+    },
+    {
+      "title": "Queue wait time",
+      "query": "histogram_quantile(0.95, sum(rate(whitenoise_execution_queue_wait_bucket[5m])) by (le))",
+      "type": "timeseries"
+    },
+    {
+      "title": "Worker active / pool size / utilization",
+      "queries": [
+        "whitenoise_worker_active",
+        "whitenoise_worker_pool_size",
+        "whitenoise_worker_utilization"
+      ],
+      "type": "timeseries"
+    },
+    {
+      "title": "Worker recycles by reason",
+      "query": "sum(rate(whitenoise_worker_recycle_count_total[5m])) by (reason)",
+      "type": "timeseries"
+    },
+    {
+      "title": "Timeouts",
+      "query": "rate(whitenoise_execution_timeouts_total[5m])",
+      "type": "timeseries"
+    },
+    {
+      "title": "Output truncations",
+      "query": "rate(whitenoise_execution_output_truncated_total[5m])",
+      "type": "timeseries"
+    },
+    {
+      "title": "Queue full rejections",
+      "query": "rate(whitenoise_execution_queue_full_total[5m])",
+      "type": "timeseries"
+    }
+  ],
+  "alerts": [
+    "Execution error rate > 5% for 10 minutes",
+    "P95 execute_code duration above baseline",
+    "Queue depth > 10",
+    "Any QueueFullError",
+    "Worker recycled for crash more than twice in 10 minutes"
+  ]
+}

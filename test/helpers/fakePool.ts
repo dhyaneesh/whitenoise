@@ -71,7 +71,9 @@ export function createFakePool(options: FakePoolOptions = {}) {
     getClient(name: string): FakeClient {
       const client = clients.get(name);
       if (!client) {
-        throw new Error(`Downstream server not connected: ${name}`);
+        const err = new Error(`Downstream server not connected: ${name}`);
+        err.name = 'DownstreamUnavailableError';
+        throw err;
       }
       return client;
     },

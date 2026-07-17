@@ -1,6 +1,20 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { SpanStatusCode } from '@opentelemetry/api';
 import { DOWNSTREAM_SERVERS, type DownstreamServer } from './servers.js';
+import { ATTR } from '../telemetry/attributes.js';
+import {
+  recordDownstreamReconnect,
+  registerDownstreamGauges,
+} from '../telemetry/metrics.js';
+import { getTracer, recordException, withSpan } from '../telemetry/tracing.js';
+
+export class DownstreamUnavailableError extends Error {
+  constructor(public readonly server: string) {
+    super(`Downstream server not connected: ${server}`);
+    this.name = 'DownstreamUnavailableError';
+  }
+}
 
 type ServerState = {
   config: DownstreamServer;
@@ -29,6 +43,20 @@ function buildChildEnv(extra?: Record<string, string>): Record<string, string> {
 export class DownstreamPool {
   private servers = new Map<string, ServerState>();
   private onChangeCallbacks: Array<() => void | Promise<void>> = [];
+  /** Known server names for gauge reporting (including disconnected). */
+  private knownServers = new Set<string>(
+    DOWNSTREAM_SERVERS.map((s) => s.name)
+  );
+
+  constructor() {
+    registerDownstreamGauges({
+      connectedServers: () =>
+        [...this.knownServers].map((server) => ({
+          server,
+          connected: this.servers.get(server)?.connected ? 1 : 0,
+        })),
+    });
+  }
 
   onChange(cb: () => void | Promise<void>): void {
     this.onChangeCallbacks.push(cb);
@@ -36,7 +64,6 @@ export class DownstreamPool {
 
   private notifyChange(): void {
     for (const cb of this.onChangeCallbacks) {
-      // Fire async callbacks without blocking reconnect; contain rejections
       Promise.resolve()
         .then(() => cb())
         .catch((err) => {
@@ -64,7 +91,7 @@ export class DownstreamPool {
     const stops = [...this.servers.values()].map(async (state) => {
       try {
         state.connected = false;
-        state.restarting = true; // Prevent auto-restart during shutdown
+        state.restarting = true;
         await state.client.close();
       } catch (err) {
         console.error('[downstream]', state.config.name, 'close failed', err);
@@ -75,45 +102,54 @@ export class DownstreamPool {
   }
 
   private async startServer(config: DownstreamServer): Promise<void> {
-    // Allow restart: only throw if server exists AND is not in restart mode
+    this.knownServers.add(config.name);
+
     const existing = this.servers.get(config.name);
     if (existing && !existing.restarting) {
       throw new Error(`Duplicate server name: ${config.name}`);
     }
 
-    const client = new Client({
-      name: 'meta-mcp-proxy',
-      version: '0.1.0',
-    });
+    await withSpan(
+      'whitenoise.downstream.connection',
+      {
+        [ATTR.DOWNSTREAM_SERVER]: config.name,
+      },
+      async (span) => {
+        const client = new Client({
+          name: 'meta-mcp-proxy',
+          version: '0.1.0',
+        });
 
-    const transport = new StdioClientTransport({
-      command: config.command,
-      args: config.args,
-      env: buildChildEnv(config.env),
-    });
+        const transport = new StdioClientTransport({
+          command: config.command,
+          args: config.args,
+          env: buildChildEnv(config.env),
+        });
 
-    // Hook disconnect detection
-    transport.onclose = () => {
-      console.warn('[downstream] disconnected:', config.name);
-      void this.handleServerFailure(config.name);
-    };
+        transport.onclose = () => {
+          console.warn('[downstream] disconnected:', config.name);
+          void this.handleServerFailure(config.name);
+        };
 
-    transport.onerror = (err: Error) => {
-      console.error('[downstream] error:', config.name, err);
-      void this.handleServerFailure(config.name);
-    };
+        transport.onerror = (err: Error) => {
+          console.error('[downstream] error:', config.name, err);
+          void this.handleServerFailure(config.name);
+        };
 
-    await client.connect(transport);
+        await client.connect(transport);
 
-    this.servers.set(config.name, {
-      config,
-      client,
-      transport,
-      connected: true,
-      restarting: false,
-    });
+        this.servers.set(config.name, {
+          config,
+          client,
+          transport,
+          connected: true,
+          restarting: false,
+        });
 
-    console.error(`[downstream] connected: ${config.name}`);
+        span.setStatus({ code: SpanStatusCode.OK });
+        console.error(`[downstream] connected: ${config.name}`);
+      }
+    );
   }
 
   private async handleServerFailure(name: string): Promise<void> {
@@ -124,30 +160,46 @@ export class DownstreamPool {
     state.connected = false;
     console.warn('[downstream] restarting:', name);
 
-    // Remove broken client immediately
     this.servers.delete(name);
     this.notifyChange();
 
-    // Exponential backoff: 1s, 2s, 3s, 4s, 5s
     for (let attempt = 1; attempt <= 5; attempt++) {
+      const reconnectStart = Date.now();
+      const span = getTracer().startSpan('whitenoise.downstream.reconnect', {
+        attributes: {
+          [ATTR.DOWNSTREAM_SERVER]: name,
+          [ATTR.RECONNECT_ATTEMPT]: attempt,
+        },
+      });
+
       try {
         await new Promise((r) => setTimeout(r, attempt * 1000));
         await this.startServer(state.config);
+        span.setAttribute(ATTR.RECONNECT_OUTCOME, 'success');
+        span.setStatus({ code: SpanStatusCode.OK });
+        span.end();
+        recordDownstreamReconnect(name, 'success');
         console.error('[downstream] reconnected:', name);
         this.notifyChange();
         return;
       } catch (err) {
         console.error(`[downstream] restart failed (${attempt}/5)`, err);
+        recordException(span, err);
+        span.setAttribute(ATTR.RECONNECT_OUTCOME, 'failure');
+        span.end();
+        recordDownstreamReconnect(name, 'failure');
+        void reconnectStart;
       }
     }
 
+    recordDownstreamReconnect(name, 'gave_up');
     console.error('[downstream] giving up on:', name);
   }
 
   getClient(name: string): Client {
     const state = this.servers.get(name);
     if (!state || !state.connected) {
-      throw new Error(`Downstream server not connected: ${name}`);
+      throw new DownstreamUnavailableError(name);
     }
     return state.client;
   }

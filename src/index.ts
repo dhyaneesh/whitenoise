@@ -4,6 +4,8 @@ import { DownstreamPool } from './downstream/pool.js';
 import { ToolCatalog } from './downstream/catalog.js';
 import { prepareWrappers, regenerateWrappers, wrappersDir } from './wrappers/manager.js';
 import { ExecutionManager } from './exec/manager.js';
+import { shutdownTelemetry } from './telemetry/instrumentation.js';
+import { recordCatalogRefreshCoalesced } from './telemetry/metrics.js';
 
 /**
  * Serialize async work so concurrent triggers collapse into at most one
@@ -16,6 +18,7 @@ function createSingleFlight(label: string) {
   return (work: () => Promise<void>) => {
     if (inflight) {
       pending = true;
+      recordCatalogRefreshCoalesced();
       return;
     }
 
@@ -94,6 +97,7 @@ async function main() {
   async function cleanup() {
     await execMgr.shutdown();
     await pool.stopAll();
+    await shutdownTelemetry();
   }
 
   installShutdownHandlers(cleanup);

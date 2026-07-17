@@ -1,0 +1,49 @@
+{
+  "title": "Downstream MCP Servers",
+  "description": "Per-server tool latency, error outcomes, reconnects, catalog freshness.",
+  "panels": [
+    {
+      "title": "Tool calls by server",
+      "query": "sum(rate(whitenoise_tool_call_count_total[5m])) by (server)",
+      "type": "timeseries"
+    },
+    {
+      "title": "P95 tool latency by server/tool",
+      "query": "histogram_quantile(0.95, sum(rate(whitenoise_tool_call_duration_bucket[5m])) by (le, server, tool))",
+      "type": "timeseries"
+    },
+    {
+      "title": "Tool outcomes (success / tool_error / protocol_error / downstream_unavailable)",
+      "query": "sum(rate(whitenoise_tool_call_count_total[5m])) by (outcome)",
+      "type": "timeseries"
+    },
+    {
+      "title": "Downstream connected (1/0)",
+      "query": "whitenoise_downstream_connected",
+      "type": "timeseries"
+    },
+    {
+      "title": "Reconnect attempts",
+      "query": "sum(rate(whitenoise_downstream_reconnect_count_total[5m])) by (server, outcome)",
+      "type": "timeseries"
+    },
+    {
+      "title": "Catalog refresh duration",
+      "query": "histogram_quantile(0.95, sum(rate(whitenoise_catalog_refresh_duration_bucket[5m])) by (le))",
+      "type": "timeseries"
+    },
+    {
+      "title": "Catalog failed servers / coalesced refreshes",
+      "queries": [
+        "rate(whitenoise_catalog_refresh_failed_servers_total[5m])",
+        "rate(whitenoise_catalog_refresh_coalesced_total[5m])"
+      ],
+      "type": "timeseries"
+    }
+  ],
+  "alerts": [
+    "Downstream server disconnected (connected=0)",
+    "Downstream tool error rate increases abnormally",
+    "Catalog refresh failures rising"
+  ]
+}

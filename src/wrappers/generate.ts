@@ -20,10 +20,16 @@ function jsDocBlock(description?: string): string {
   return `/**\n${lines.map((l) => ` * ${l}`).join('\n')}\n */\n`;
 }
 
+export type WrapperGenerationResult = {
+  toolCount: number;
+  serverCount: number;
+  fileCount: number;
+};
+
 export async function generateWrappers(
   wrappersDir: string,
   catalog: ToolCatalog
-): Promise<void> {
+): Promise<WrapperGenerationResult> {
   // 1. Bridge module
   const bridgeDir = path.join(wrappersDir, 'bridge');
   await mkdir(bridgeDir, { recursive: true });
@@ -48,6 +54,12 @@ export async function generateWrappers(
   );
 
   await Promise.all(entries.map((entry) => writeToolWrapper(wrappersDir, entry)));
+
+  return {
+    toolCount: entries.length,
+    serverCount: servers.length,
+    fileCount: 1 + entries.length * 2,
+  };
 }
 
 async function writeToolWrapper(

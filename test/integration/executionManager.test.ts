@@ -5,7 +5,14 @@ import { createFakePool } from '../helpers/fakePool.js';
 import { makeTempDir, removeTempDir } from '../helpers/tempDir.js';
 import type { DownstreamPool } from '../../src/downstream/pool.js';
 
-type ExecResult = { durationMs: number; stdout: string; stderr: string };
+type ExecResult = {
+  durationMs: number;
+  stdout: string;
+  stderr: string;
+  stdoutTruncated: boolean;
+  stderrTruncated: boolean;
+  downstreamCallCount: number;
+};
 
 type ExecutionManagerLike = {
   execute: (

@@ -5,6 +5,12 @@ import type { DownstreamPool } from './pool.js';
 import { makeFqTool, makeSpecifier } from './names.js';
 import { jsonSchemaToZod } from './schemaConverter.js';
 import { MCPResultSchema } from '../proxy/runtimeSchemas.js';
+import { ATTR, byteLength } from '../telemetry/attributes.js';
+import {
+  recordCatalogFailedServers,
+  recordCatalogRefreshDuration,
+} from '../telemetry/metrics.js';
+import { withSpan } from '../telemetry/tracing.js';
 
 export type CatalogEntry = {
   server: string;
@@ -18,6 +24,13 @@ export type CatalogEntry = {
   outputSchema?: z.ZodTypeAny;
 };
 
+export type SearchResult = {
+  results: CatalogEntry[];
+  fallbackUsed: boolean;
+  zeroMatch: boolean;
+  topScore: number;
+};
+
 /** Internal entry with precomputed lowercase fields for search */
 type IndexedEntry = CatalogEntry & {
   toolLower: string;
@@ -29,6 +42,8 @@ export class ToolCatalog {
   private entries: IndexedEntry[] = [];
   /** Deterministic browse order — rebuilt on refresh */
   private browseOrder: IndexedEntry[] = [];
+  private lastDefinitionBytes = 0;
+  private lastFailedServers = 0;
 
   constructor(private pool: DownstreamPool) {}
 
@@ -37,57 +52,92 @@ export class ToolCatalog {
    * A single failing server is logged and skipped (does not abort the refresh).
    */
   async refresh(): Promise<void> {
-    const serverNames = this.pool.getServerNames();
+    const started = Date.now();
+    await withSpan('whitenoise.catalog.refresh', undefined, async (span) => {
+      const serverNames = this.pool.getServerNames();
 
-    const results = await Promise.allSettled(
-      serverNames.map(async (server) => {
-        const tools = await this.pool.listTools(server);
-        return { server, tools };
-      })
-    );
+      const results = await Promise.allSettled(
+        serverNames.map(async (server) =>
+          withSpan(
+            `mcp.client tools/list [${server}]`,
+            {
+              [ATTR.MCP_METHOD_NAME]: 'tools/list',
+              [ATTR.DOWNSTREAM_SERVER]: server,
+            },
+            async () => {
+              const tools = await this.pool.listTools(server);
+              return { server, tools };
+            }
+          )
+        )
+      );
 
-    const all: IndexedEntry[] = [];
+      const all: IndexedEntry[] = [];
+      let failedServers = 0;
 
-    for (const result of results) {
-      if (result.status === 'rejected') {
-        console.error(
-          '[catalog] listTools failed for a server:',
-          result.reason
-        );
-        continue;
-      }
-
-      const { server, tools } = result.value;
-
-      for (const tool of tools) {
-        const fqTool = makeFqTool(server, tool.name);
-
-        // Validate fqTool integrity - fail fast on corruption
-        if (!fqTool.includes('__')) {
-          throw new Error(`Invalid fqTool generated: ${fqTool}`);
+      for (const result of results) {
+        if (result.status === 'rejected') {
+          failedServers += 1;
+          console.error(
+            '[catalog] listTools failed for a server:',
+            result.reason
+          );
+          continue;
         }
 
-        const description = tool.description;
-        all.push({
-          server,
-          tool: tool.name,
-          fqTool,
-          specifier: makeSpecifier(server, tool.name),
-          description,
-          inputSchema: jsonSchemaToZod(tool.inputSchema),
-          inputSchemaRaw: tool.inputSchema,
-          outputSchema: MCPResultSchema,
-          toolLower: tool.name.toLowerCase(),
-          fqToolLower: fqTool.toLowerCase(),
-          descLower: description?.toLowerCase() ?? '',
-        });
-      }
-    }
+        const { server, tools } = result.value;
 
-    this.entries = all;
-    this.browseOrder = [...all].sort(
-      (a, b) => a.tool.localeCompare(b.tool) || a.fqTool.localeCompare(b.fqTool)
-    );
+        for (const tool of tools) {
+          const fqTool = makeFqTool(server, tool.name);
+
+          if (!fqTool.includes('__')) {
+            throw new Error(`Invalid fqTool generated: ${fqTool}`);
+          }
+
+          const description = tool.description;
+          all.push({
+            server,
+            tool: tool.name,
+            fqTool,
+            specifier: makeSpecifier(server, tool.name),
+            description,
+            inputSchema: jsonSchemaToZod(tool.inputSchema),
+            inputSchemaRaw: tool.inputSchema,
+            outputSchema: MCPResultSchema,
+            toolLower: tool.name.toLowerCase(),
+            fqToolLower: fqTool.toLowerCase(),
+            descLower: description?.toLowerCase() ?? '',
+          });
+        }
+      }
+
+      this.entries = all;
+      this.browseOrder = [...all].sort(
+        (a, b) =>
+          a.tool.localeCompare(b.tool) || a.fqTool.localeCompare(b.fqTool)
+      );
+      this.lastFailedServers = failedServers;
+      this.lastDefinitionBytes = computeDefinitionBytes(all);
+
+      const partial = failedServers > 0;
+      span.setAttribute(ATTR.CATALOG_TOOL_COUNT, all.length);
+      span.setAttribute(ATTR.CATALOG_SERVER_COUNT, serverNames.length);
+      span.setAttribute(ATTR.CATALOG_DEFINITION_BYTES, this.lastDefinitionBytes);
+      span.setAttribute(ATTR.CATALOG_PARTIAL, partial);
+      span.setAttribute(ATTR.CATALOG_FAILED_SERVERS, failedServers);
+
+      recordCatalogFailedServers(failedServers);
+    });
+
+    recordCatalogRefreshDuration(Date.now() - started);
+  }
+
+  getDefinitionBytes(): number {
+    return this.lastDefinitionBytes;
+  }
+
+  getLastFailedServers(): number {
+    return this.lastFailedServers;
   }
 
   /**
@@ -98,17 +148,27 @@ export class ToolCatalog {
   }
 
   /**
-   * Search tools by name/description.
+   * Search tools by name/description (convenience wrapper).
    */
   search(query: string, limit = 20): CatalogEntry[] {
+    return this.searchDetailed(query, limit).results;
+  }
+
+  /**
+   * Search with telemetry-friendly metadata (fallback / zero-match / top score).
+   */
+  searchDetailed(query: string, limit = 20): SearchResult {
     const trimmed = query.trim().toLowerCase();
 
-    // Empty query: fall back to a deterministic "browse" listing.
     if (!trimmed) {
-      return this.browseOrder.slice(0, limit).map(toPublic);
+      return {
+        results: this.browseOrder.slice(0, limit).map(toPublic),
+        fallbackUsed: true,
+        zeroMatch: false,
+        topScore: 0,
+      };
     }
 
-    // Tokenize query into words (whitespace + punctuation).
     const words = trimmed.split(/[^a-z0-9]+/i).filter(Boolean);
 
     const scored: { entry: IndexedEntry; score: number }[] = [];
@@ -118,13 +178,34 @@ export class ToolCatalog {
     }
 
     if (scored.length === 0) {
-      // Empty-result fallback: browse-style list so the caller can still discover tools.
-      return this.browseOrder.slice(0, limit).map(toPublic);
+      return {
+        results: this.browseOrder.slice(0, limit).map(toPublic),
+        fallbackUsed: true,
+        zeroMatch: true,
+        topScore: 0,
+      };
     }
 
     scored.sort((a, b) => b.score - a.score);
-    return scored.slice(0, limit).map((r) => toPublic(r.entry));
+    return {
+      results: scored.slice(0, limit).map((r) => toPublic(r.entry)),
+      fallbackUsed: false,
+      zeroMatch: false,
+      topScore: scored[0]?.score ?? 0,
+    };
   }
+}
+
+function computeDefinitionBytes(entries: CatalogEntry[]): number {
+  return byteLength(
+    JSON.stringify(
+      entries.map((entry) => ({
+        name: entry.fqTool,
+        description: entry.description,
+        inputSchema: entry.inputSchemaRaw,
+      }))
+    )
+  );
 }
 
 function toPublic(entry: IndexedEntry): CatalogEntry {
@@ -140,9 +221,6 @@ function toPublic(entry: IndexedEntry): CatalogEntry {
   };
 }
 
-/**
- * Simple deterministic scoring using precomputed lowercase fields.
- */
 function scoreEntry(entry: IndexedEntry, words: string[]): number {
   if (words.length === 0) return 0;
 
