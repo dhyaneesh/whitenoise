@@ -4,7 +4,7 @@ import { z } from 'zod';
 /**
  * Canonical MCP success envelope
  */
-const MCPSuccessSchema = z.object({
+export const MCPSuccessSchema = z.object({
   content: z.array(
     z.object({
       type: z.string(),
@@ -18,7 +18,7 @@ const MCPSuccessSchema = z.object({
 /**
  * Canonical MCP error envelope
  */
-const MCPErrorSchema = z.object({
+export const MCPErrorSchema = z.object({
   isError: z.literal(true),
   content: z.array(
     z.object({
