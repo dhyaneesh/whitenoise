@@ -124,6 +124,7 @@ console.log(JSON.stringify(result));
     const result = await m.execute(code, { timeoutMs: 15_000 });
     expect(called?.name).toBe('read_file');
     expect(called?.arguments).toEqual({ path: '/tmp/example.txt' });
+    expect(result.downstreamCallCount).toBe(1);
     expect(result.stdout).toContain('file-contents-here');
   });
 

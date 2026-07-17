@@ -248,6 +248,15 @@ parentPort!.on('message', async (msg: MainToWorker) => {
 
       clearTimeout(hardTimeout);
 
+      // Drain buffered stdout/stderr before reporting completion so the
+      // manager reliably captures all output (worker thread pipe flushes
+      // are not ordered relative to postMessage).
+      await new Promise<void>((resolve) => {
+        process.stdout.write('', () => {
+          process.stderr.write('', () => resolve());
+        });
+      });
+
       parentPort!.postMessage({
         type: 'runResult',
         id: runId,
