@@ -17,10 +17,11 @@ Standard MCP integrations suffer from two bottlenecks:
 ```typescript
 // One execute_code call replaces multiple round-trips:
 import { readFile } from 'mcp/servers/filesystem/readFile';
-import { createEntities } from 'mcp/servers/memory/createEntities';
+import { writeFile } from 'mcp/servers/filesystem/writeFile';
 
-const content = await readFile({ path: '/abs/path/to/notes.json' });
-await createEntities({ entities: JSON.parse(/* ... */) });
+const content = await readFile({ path: '/path/to/notes.json' });
+const transformed = JSON.parse(content.content[0].text).map(/* ... */);
+await writeFile({ path: '/path/to/output.json', content: JSON.stringify(transformed) });
 ```
 
 ## Architecture
@@ -40,7 +41,7 @@ graph TD
         Wrappers["Generated Wrappers
         mcp/bridge/callMCPTool.ts
         mcp/servers/filesystem/readFile.ts
-        mcp/servers/memory/..."]
+        mcp/servers/context7/..."]
 
         ExecMgr["Execution Manager
         worker pool
@@ -50,16 +51,18 @@ graph TD
 
     subgraph Downstream["Downstream MCP Servers"]
         FS["filesystem"]
-        MEM["memory"]
-        PW["playwright"]
+        ST["sequentialThinking"]
+        CDP["chromeDevtools"]
+        C7["context7"]
     end
 
     LLM -- "stdio / MCP protocol" --> MetaTools
     MetaTools --> Wrappers
     MetaTools --> ExecMgr
     ExecMgr --> FS
-    ExecMgr --> MEM
-    ExecMgr --> PW
+    ExecMgr --> ST
+    ExecMgr --> CDP
+    ExecMgr --> C7
 ```
 
 ## Getting Started
@@ -89,24 +92,46 @@ npm start
 
 The server communicates over **stdio** using the MCP protocol. Point any MCP-compatible client (Claude Desktop, Cursor, etc.) at the built binary (`dist/index.js`).
 
+`npm start` boots the server with OpenTelemetry instrumentation (`--import ./dist/telemetry/instrumentation.js`). By default traces and metrics are exported to `http://localhost:4318`. If no OTLP collector is listening, the exporter logs a warning to stderr and the server keeps running — telemetry is non-blocking.
+
+### Run with SigNoz
+
+Start the observability stack, then run WhiteNoise:
+
+```bash
+# Start SigNoz (docker compose)
+foundryctl cast -f observability/casting.yaml
+
+# Run the proxy — telemetry auto-connects to SigNoz at localhost:4318
+npm start
+```
+
+Traces and metrics appear under the `whitenoise` service in the SigNoz UI at `http://localhost:8080`. See [`observability/README.md`](observability/README.md) for environment variables, dashboards, and privacy defaults.
+
 ### Development
 
 ```bash
-# Run directly via ts-node (no build step)
+# Build and run in one step
 npm run dev
 
 # Unit + hermetic integration tests
 npm test
 
+# Unit tests only
+npm run test:unit
+
 # Real end-to-end (boots proxy + downstream servers)
 npm run test:e2e
+
+# Coverage over src/
+npm run test:coverage
 ```
 
 See [TESTING.md](TESTING.md) for the full automated suite, CI notes, and the manual MCP Inspector checklist.
 
 ## Configuring Downstream Servers
 
-Edit [`src/downstream/servers.ts`](src/downstream/servers.ts) to add, remove, or change downstream MCP servers. Each entry has four fields:
+Edit [`src/downstream/servers.json`](src/downstream/servers.json) to add, remove, or change downstream MCP servers. Each entry has four fields:
 
 | Field     | Type                           | Description                                       |
 | --------- | ------------------------------ | ------------------------------------------------- |
@@ -115,30 +140,35 @@ Edit [`src/downstream/servers.ts`](src/downstream/servers.ts) to add, remove, or
 | `args`    | `string[]`                     | Arguments passed to the command                   |
 | `env`     | `Record<string, string>` (opt) | Extra environment variables for the child process |
 
-The default configuration ships with three servers:
+Use `"$PROJECT_ROOT"` in any `args` string to inject the absolute repo-root path at startup. The [`servers.ts`](src/downstream/servers.ts) file reads the JSON, validates every entry, and expands placeholders — no logic lives in the config.
 
-```typescript
-export const DOWNSTREAM_SERVERS: DownstreamServer[] = [
-  {
-    name: 'filesystem',
-    command: 'npx',
-    args: [
-      '-y',
-      '@modelcontextprotocol/server-filesystem',
-      PROJECT_ROOT, // absolute repo root
-    ],
-  },
-  {
-    name: 'memory',
-    command: 'npx',
-    args: ['-y', '@modelcontextprotocol/server-memory'],
-  },
-  {
-    name: 'playwright',
-    command: 'npx',
-    args: ['-y', '@playwright/mcp@latest'],
-  },
-];
+The default configuration ships with four servers:
+
+```json
+{
+  "servers": [
+    {
+      "name": "filesystem",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "$PROJECT_ROOT"]
+    },
+    {
+      "name": "sequentialThinking",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"]
+    },
+    {
+      "name": "chromeDevtools",
+      "command": "npx",
+      "args": ["-y", "chrome-devtools-mcp"]
+    },
+    {
+      "name": "context7",
+      "command": "npx",
+      "args": ["-y", "@upstash/context7-mcp"]
+    }
+  ]
+}
 ```
 
 After editing, rebuild and restart. First boot may need npm registry access because servers are started with `npx -y`.
@@ -319,11 +349,19 @@ src/
                                   execution manager, MCP server, hot reload
 
   downstream/
-    servers.ts                    Downstream server configuration (data only)
+    servers.json                  Human-editable downstream server list
+    servers.ts                    JSON reader, validator, and placeholder resolver
     pool.ts                       Connection pool with auto-restart
     catalog.ts                    Aggregated tool catalog with search scoring
     names.ts                      Fully-qualified tool name helpers
     schemaConverter.ts            JSON Schema → Zod (runtime + source emit)
+
+  telemetry/
+    instrumentation.ts            OTel NodeSDK bootstrap (loaded before app code)
+    tracing.ts                    Span helpers (withSpan, startChildSpan, etc.)
+    metrics.ts                    Metric instruments (histograms, counters, gauges)
+    errors.ts                     Error classification and model-facing payloads
+    attributes.ts                 Span attribute constants and hashing helpers
 
   proxy/
     server.ts                     MCP server exposing the four meta-tools
@@ -341,6 +379,7 @@ src/
     protocol.ts                   Main ↔ Worker message types
     esbuildPlugin.ts              Resolves mcp/* imports
 
+observability/                    SigNoz docker compose stack, dashboards, casting config
 test/
   unit/                           Fast tests against src/
   integration/                    Hermetic tests against dist/ + fake pool
@@ -350,15 +389,21 @@ test/
 
 ## Dependencies
 
-| Package                                   | Purpose                                      |
-| ----------------------------------------- | -------------------------------------------- |
-| `@modelcontextprotocol/sdk`               | MCP client and server SDK                    |
-| `@modelcontextprotocol/server-filesystem` | Filesystem MCP server                        |
-| `@playwright/mcp`                         | Playwright MCP server                        |
-| `zod`                                     | Schema validation and wrapper code generation |
-| `esbuild`                                 | Bundling user-submitted TypeScript           |
-| `typescript`                              | Type checking and compilation                |
-| `vitest`                                  | Test runner (dev)                            |
+| Package                                     | Purpose                                        |
+| ------------------------------------------- | ---------------------------------------------- |
+| `@modelcontextprotocol/sdk`                 | MCP client and server SDK                      |
+| `@modelcontextprotocol/server-filesystem`    | Filesystem MCP server                          |
+| `@modelcontextprotocol/server-sequential-thinking` | Structured reasoning MCP server        |
+| `chrome-devtools-mcp`                       | Chrome DevTools protocol MCP server             |
+| `@upstash/context7-mcp`                     | Library documentation lookup MCP server         |
+| `zod`                                       | Schema validation and wrapper code generation   |
+| `esbuild`                                   | Bundling user-submitted TypeScript             |
+| `@opentelemetry/api`                        | OpenTelemetry API interfaces                   |
+| `@opentelemetry/sdk-node`                   | Node.js OTel SDK bootstrap                     |
+| `@opentelemetry/exporter-trace-otlp-http`   | OTLP/HTTP trace exporter                       |
+| `@opentelemetry/exporter-metrics-otlp-http` | OTLP/HTTP metric exporter                      |
+| `typescript`                                | Type checking and compilation (dev)            |
+| `vitest`                                    | Test runner (dev)                              |
 
 ## License
 
