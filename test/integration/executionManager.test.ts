@@ -29,22 +29,27 @@ async function loadDist() {
   const generateUrl = pathToFileURL(
     path.join(process.cwd(), 'dist/wrappers/generate.js')
   ).href;
+  const genUrl = pathToFileURL(
+    path.join(process.cwd(), 'dist/wrappers/generations.js')
+  ).href;
   const execUrl = pathToFileURL(
     path.join(process.cwd(), 'dist/exec/manager.js')
   ).href;
 
-  const [{ ToolCatalog }, { generateWrappers }, exec] = await Promise.all([
+  const [{ ToolCatalog }, { generateWrappers }, { GenerationStore }, exec] = await Promise.all([
     import(catalogUrl),
     import(generateUrl),
+    import(genUrl),
     import(execUrl),
   ]);
 
   return {
     ToolCatalog,
     generateWrappers,
+    GenerationStore,
     ExecutionManager: exec.ExecutionManager as new (
       pool: DownstreamPool,
-      wrappersDir: string,
+      store: InstanceType<typeof GenerationStore>,
       options?: { poolSize?: number; maxRunsPerWorker?: number }
     ) => ExecutionManagerLike,
     ExecutionTimeoutError: exec.ExecutionTimeoutError as new (
@@ -56,21 +61,25 @@ async function loadDist() {
 
 describe('ExecutionManager', () => {
   let dist: Awaited<ReturnType<typeof loadDist>>;
-  let wrappersDir: string;
+  let store: InstanceType<typeof dist.GenerationStore>;
+  let tmpBase: string;
   let mgr: ExecutionManagerLike | null = null;
 
   beforeAll(async () => {
     dist = await loadDist();
-    wrappersDir = await makeTempDir('wn-exec-wrap-');
+    tmpBase = await makeTempDir('wn-exec-wrap-');
+    const wrappersRoot = path.join(tmpBase, 'wrappers');
+    store = new dist.GenerationStore(wrappersRoot);
+    await store.init();
 
     const pool = createFakePool();
     const catalog = new dist.ToolCatalog(pool as unknown as DownstreamPool);
     await catalog.refresh();
-    await dist.generateWrappers(wrappersDir, catalog);
+    await store.publish((genDir) => dist.generateWrappers(genDir, catalog));
   });
 
   afterAll(async () => {
-    await removeTempDir(wrappersDir);
+    await removeTempDir(tmpBase);
   });
 
   afterEach(async () => {
@@ -87,7 +96,7 @@ describe('ExecutionManager', () => {
     const pool = createFakePool(poolOpts);
     mgr = new dist.ExecutionManager(
       pool as unknown as DownstreamPool,
-      wrappersDir,
+      store,
       { poolSize: 1, ...execOpts }
     );
     return { mgr, pool };

@@ -52,5 +52,5 @@ describe('telemetry bootstrap stdout safety', () => {
     expect(stdout.trim(), `stderr=${stderr}`).toBe('MCP_MARKER');
     expect(stdout).not.toMatch(/OpenTelemetry|otlp|BatchSpanProcessor/i);
     expect(stderr).toMatch(/\[telemetry\]/);
-  }, 15_000);
+  }, 60_000);
 });

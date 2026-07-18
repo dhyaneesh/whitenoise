@@ -2,7 +2,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { createProxyServer } from './proxy/server.js';
 import { DownstreamPool } from './downstream/pool.js';
 import { ToolCatalog } from './downstream/catalog.js';
-import { prepareWrappers, regenerateWrappers, wrappersDir } from './wrappers/manager.js';
+import { prepareWrappers, regenerateWrappers, getGenerationStore } from './wrappers/manager.js';
 import { ExecutionManager } from './exec/manager.js';
 import { shutdownTelemetry } from './telemetry/instrumentation.js';
 import { recordCatalogRefreshCoalesced } from './telemetry/metrics.js';
@@ -88,8 +88,24 @@ async function main() {
     });
   });
 
-  const execMgr = new ExecutionManager(pool, wrappersDir);
+  const execMgr = new ExecutionManager(pool, getGenerationStore());
   const server = createProxyServer(catalog, execMgr);
+
+  // Prevent EPIPE crashes when the client disconnects unexpectedly
+  process.stdout.on('error', (err: NodeJS.ErrnoException) => {
+    if (err.code === 'EPIPE') {
+      console.error('[proxy] stdout EPIPE — client disconnected');
+      return;
+    }
+    console.error('[proxy] stdout error:', err);
+  });
+  process.stdin.on('error', (err: NodeJS.ErrnoException) => {
+    if (err.code === 'EPIPE') {
+      console.error('[proxy] stdin EPIPE — client disconnected');
+      return;
+    }
+    console.error('[proxy] stdin error:', err);
+  });
 
   const transport = new StdioServerTransport();
   await server.connect(transport);

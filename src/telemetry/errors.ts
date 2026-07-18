@@ -1,5 +1,6 @@
 // src/telemetry/errors.ts
 import type { WorkerErrorType } from '../exec/protocol.js';
+import type { CompilerErrorDetail } from '../exec/protocol.js';
 
 export type ExecutionErrorType =
   | 'COMPILATION_ERROR'
@@ -20,6 +21,7 @@ export type ClassifiedError = {
   type: ExecutionErrorType;
   message: string;
   recoverable: boolean;
+  details?: CompilerErrorDetail[];
 };
 
 const RECOVERABLE: ReadonlySet<ExecutionErrorType> = new Set([
@@ -37,7 +39,8 @@ const RECOVERABLE: ReadonlySet<ExecutionErrorType> = new Set([
 export class WorkerExecutionError extends Error {
   constructor(
     public readonly errorType: WorkerErrorType,
-    message: string
+    message: string,
+    public readonly details?: CompilerErrorDetail[]
   ) {
     super(message);
     this.name = 'WorkerExecutionError';
@@ -78,6 +81,7 @@ export function classifyExecutionError(err: unknown): ClassifiedError {
       type: err.errorType,
       message: err.message,
       recoverable: isRecoverable(err.errorType),
+      ...(err.details ? { details: err.details } : {}),
     };
   }
 

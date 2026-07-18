@@ -3,7 +3,11 @@
     {
       "name": "filesystem",
       "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "$PROJECT_ROOT"]
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "$PROJECT_ROOT"],
+      "toolPolicies": {
+        "*": { "timeoutMs": 30000, "maxResultBytes": 5242880 },
+        "directory_tree": { "maxResultBytes": 1048576 }
+      }
     },
     {
       "name": "sequentialThinking",
@@ -19,6 +23,33 @@
       "name": "context7",
       "command": "npx",
       "args": ["-y", "@upstash/context7-mcp"]
+    },
+    {
+      "name": "postgres",
+      "command": "node",
+      "args": ["$PROJECT_ROOT/dist/downstream/postgresServer.js", "postgresql://postgres:postgres@localhost:5432/whitenoise_test"]
+    },
+    {
+      "name": "github",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "$GITHUB_PERSONAL_ACCESS_TOKEN" }
+    },
+    {
+      "name": "braveSearch",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-brave-search"],
+      "env": { "BRAVE_API_KEY": "$BRAVE_API_KEY" }
+    },
+    {
+      "name": "memory",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-memory"]
+    },
+    {
+      "name": "everything",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-everything"]
     }
   ]
 }

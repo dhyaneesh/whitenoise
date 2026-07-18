@@ -1,5 +1,10 @@
 import type { FakeTool } from './fixtures.js';
 import { filesystemTools, memoryTools } from './fixtures.js';
+import {
+  DEFAULT_TOOL_TIMEOUT_MS,
+  DEFAULT_MAX_RESULT_BYTES,
+  type ToolPolicy,
+} from '../../src/downstream/servers.js';
 
 type CallToolArgs = {
   name: string;
@@ -76,6 +81,13 @@ export function createFakePool(options: FakePoolOptions = {}) {
         throw err;
       }
       return client;
+    },
+
+    getToolPolicy(_server: string, _tool: string): ToolPolicy {
+      return {
+        timeoutMs: DEFAULT_TOOL_TIMEOUT_MS,
+        maxResultBytes: DEFAULT_MAX_RESULT_BYTES,
+      };
     },
   };
 }

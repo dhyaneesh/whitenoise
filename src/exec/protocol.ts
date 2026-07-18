@@ -20,7 +20,15 @@ export type RunMessage = {
   payload: {
     script: string;
     wrappersDir: string;
+    generationId: number;
   };
+};
+
+export type CompilerErrorDetail = {
+  file?: string;
+  line?: number;
+  column?: number;
+  text: string;
 };
 
 export type RunResultMessage = {
@@ -33,6 +41,7 @@ export type RunResultMessage = {
         error: {
           type: WorkerErrorType;
           message: string;
+          details?: CompilerErrorDetail[];
         };
       };
 };

@@ -1,6 +1,14 @@
 import path from 'node:path';
 import { readdir, readFile, stat } from 'node:fs/promises';
-import { wrappersDir } from './manager.js';
+import { getGenerationStore } from './manager.js';
+
+function currentWrappersDir(): string {
+  const gen = getGenerationStore().current();
+  if (!gen) {
+    throw new Error('No wrapper generation has been published yet');
+  }
+  return gen.dir;
+}
 
 function toSpecifier(filePath: string, rootDir: string): string {
   const rel = path.relative(rootDir, filePath);
@@ -29,23 +37,25 @@ async function walkDirectory(dir: string, rootDir: string): Promise<string[]> {
 
 export async function listModules(
   subPath = '',
-  baseDir = wrappersDir
+  baseDir?: string
 ): Promise<string[]> {
-  const dir = path.join(baseDir, subPath);
+  const root = baseDir ?? currentWrappersDir();
+  const dir = path.join(root, subPath);
   // Always list all .ts files recursively
-  return walkDirectory(dir, baseDir);
+  return walkDirectory(dir, root);
 }
 
 export async function readModule(
   specifier: string,
-  baseDir = wrappersDir
+  baseDir?: string
 ): Promise<string> {
   if (!specifier.startsWith('mcp/')) {
     throw new Error(`Invalid module specifier: ${specifier}`);
   }
 
   const rel = specifier.slice('mcp/'.length);
-  const filePath = path.join(baseDir, rel + '.ts');
+  const root = baseDir ?? currentWrappersDir();
+  const filePath = path.join(root, rel + '.ts');
 
   const s = await stat(filePath);
   if (!s.isFile()) {

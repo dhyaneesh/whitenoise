@@ -20,6 +20,7 @@ import {
 import { modelFacingErrorPayload } from '../telemetry/errors.js';
 import {
   recordDiscoveryBytes,
+  recordError,
   recordModuleRead,
   recordSearchDuration,
   recordSearchZeroMatch,
@@ -228,6 +229,7 @@ export function createProxyServer(
           } catch (err: unknown) {
             const classified = modelFacingErrorPayload(err);
             span.setAttribute(ATTR.ERROR_TYPE, classified.type);
+            recordError({ layer: 'proxy', type: classified.type });
             const text = JSON.stringify(classified, null, 2);
             span.setAttribute(ATTR.RESPONSE_BYTES, byteLength(text));
             return {

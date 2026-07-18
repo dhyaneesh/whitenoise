@@ -78,6 +78,12 @@ export const ATTR = {
 
   RECONNECT_ATTEMPT: 'whitenoise.downstream.reconnect.attempt',
   RECONNECT_OUTCOME: 'whitenoise.downstream.reconnect.outcome',
+
+  WRAPPER_GENERATION_ID: 'whitenoise.wrapper.generation_id',
+  WRAPPER_SWAP_REASON: 'whitenoise.wrapper.swap.reason',
+  EXECUTION_RUN_ID: 'whitenoise.execution.run_id',
+  ERROR_LAYER: 'whitenoise.error.layer',
+  ERROR_SIGNATURE: 'whitenoise.error.signature',
 } as const;
 
 export function sha256Hex(data: string): string {

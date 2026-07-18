@@ -9,6 +9,8 @@ import { ATTR, byteLength } from '../telemetry/attributes.js';
 import {
   recordCatalogFailedServers,
   recordCatalogRefreshDuration,
+  registerCatalogGauges,
+  recordError,
 } from '../telemetry/metrics.js';
 import { withSpan } from '../telemetry/tracing.js';
 
@@ -22,6 +24,8 @@ export type CatalogEntry = {
   inputSchema?: z.ZodTypeAny;
   inputSchemaRaw?: unknown;
   outputSchema?: z.ZodTypeAny;
+  /** True when the server's latest listTools failed and this entry is from a prior refresh */
+  degraded?: boolean;
 };
 
 export type SearchResult = {
@@ -44,17 +48,34 @@ export class ToolCatalog {
   private browseOrder: IndexedEntry[] = [];
   private lastDefinitionBytes = 0;
   private lastFailedServers = 0;
+  /** Per-server entries from the most recent successful listTools */
+  private perServer = new Map<string, IndexedEntry[]>();
+  /** Servers whose latest listTools failed (entries are last-known-good) */
+  private degradedServers = new Set<string>();
+  /** All known server names (for gauge reporting) */
+  private knownServers = new Set<string>();
 
-  constructor(private pool: DownstreamPool) {}
+  constructor(private pool: DownstreamPool) {
+    registerCatalogGauges({
+      degradedServers: () =>
+        [...this.knownServers].map((server) => ({
+          server,
+          degraded: this.degradedServers.has(server) ? 1 : 0,
+        })),
+    });
+  }
 
   /**
    * Refresh catalog by querying all downstream servers in parallel.
-   * A single failing server is logged and skipped (does not abort the refresh).
+   * A failing server retains its last-known-good entries (marked degraded)
+   * instead of dropping them — so temporary disconnections don't erase
+   * tool discovery. A server that has never succeeded contributes nothing.
    */
   async refresh(): Promise<void> {
     const started = Date.now();
     await withSpan('whitenoise.catalog.refresh', undefined, async (span) => {
       const serverNames = this.pool.getServerNames();
+      for (const name of serverNames) this.knownServers.add(name);
 
       const results = await Promise.allSettled(
         serverNames.map(async (server) =>
@@ -72,20 +93,28 @@ export class ToolCatalog {
         )
       );
 
-      const all: IndexedEntry[] = [];
       let failedServers = 0;
 
-      for (const result of results) {
+      for (let i = 0; i < results.length; i++) {
+        const result = results[i];
+        const server = serverNames[i];
+
         if (result.status === 'rejected') {
           failedServers += 1;
           console.error(
             '[catalog] listTools failed for a server:',
             result.reason
           );
+          recordError({ layer: 'catalog', type: 'list_tools_failed', server });
+          // Mark degraded; keep last-known-good entries (if any)
+          this.degradedServers.add(server);
           continue;
         }
 
-        const { server, tools } = result.value;
+        // Success — clear degraded flag and replace entries
+        this.degradedServers.delete(server);
+        const { tools } = result.value;
+        const serverEntries: IndexedEntry[] = [];
 
         for (const tool of tools) {
           const fqTool = makeFqTool(server, tool.name);
@@ -95,7 +124,7 @@ export class ToolCatalog {
           }
 
           const description = tool.description;
-          all.push({
+          serverEntries.push({
             server,
             tool: tool.name,
             fqTool,
@@ -108,6 +137,19 @@ export class ToolCatalog {
             fqToolLower: fqTool.toLowerCase(),
             descLower: description?.toLowerCase() ?? '',
           });
+        }
+
+        this.perServer.set(server, serverEntries);
+      }
+
+      // Flatten per-server entries into the global list, marking degraded ones
+      const all: IndexedEntry[] = [];
+      for (const server of serverNames) {
+        const serverEntries = this.perServer.get(server);
+        if (!serverEntries) continue;
+        const degraded = this.degradedServers.has(server);
+        for (const entry of serverEntries) {
+          all.push(degraded ? { ...entry, degraded: true } : entry);
         }
       }
 
@@ -125,11 +167,17 @@ export class ToolCatalog {
       span.setAttribute(ATTR.CATALOG_DEFINITION_BYTES, this.lastDefinitionBytes);
       span.setAttribute(ATTR.CATALOG_PARTIAL, partial);
       span.setAttribute(ATTR.CATALOG_FAILED_SERVERS, failedServers);
+      span.setAttribute('whitenoise.catalog.degraded_servers', this.degradedServers.size);
 
       recordCatalogFailedServers(failedServers);
     });
 
     recordCatalogRefreshDuration(Date.now() - started);
+  }
+
+  /** Servers whose entries are currently stale (last-known-good). */
+  getDegradedServers(): string[] {
+    return [...this.degradedServers];
   }
 
   getDefinitionBytes(): number {
@@ -218,6 +266,7 @@ function toPublic(entry: IndexedEntry): CatalogEntry {
     inputSchema: entry.inputSchema,
     inputSchemaRaw: entry.inputSchemaRaw,
     outputSchema: entry.outputSchema,
+    ...(entry.degraded ? { degraded: true } : {}),
   };
 }
 

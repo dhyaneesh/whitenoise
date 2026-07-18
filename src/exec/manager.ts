@@ -22,6 +22,7 @@ import {
   DownstreamUnavailableError,
   type DownstreamPool,
 } from '../downstream/pool.js';
+import { GenerationStore, type GenerationId } from '../wrappers/generations.js';
 import { ATTR, jsonByteLength, type Outcome, type RecycleReason } from '../telemetry/attributes.js';
 import { WorkerExecutionError } from '../telemetry/errors.js';
 import {
@@ -38,11 +39,14 @@ import {
   recordExecutionDuration,
   recordExecutionTimeout,
   recordExecutionToolCalls,
+  recordError,
   recordOutputTruncated,
   recordQueueFull,
   recordQueueWait,
   recordRoundTripsAvoided,
   recordToolCall,
+  recordToolCallBytes,
+  recordToolCallOversize,
   recordWorkerRecycle,
   recordWorkerRun,
   registerPoolGauges,
@@ -119,6 +123,7 @@ type ActiveRun = {
   intermediateResultBytes: number;
   toolSequence: number;
   openStages: Map<WorkerStage, { start: number; attrs?: StageMessage['payload']['attributes'] }>;
+  generationId: GenerationId;
 };
 
 type WorkerSlot = {
@@ -144,7 +149,7 @@ export class ExecutionManager {
   private queue: QueuedJob[] = [];
   private inFlightToolCalls = new Map<
     string,
-    { runId: string; slotId: string }
+    { runId: string; slotId: string; controller: AbortController }
   >();
   private readonly poolSize: number;
   private readonly maxRunsPerWorker: number;
@@ -152,7 +157,7 @@ export class ExecutionManager {
 
   constructor(
     private downstream: DownstreamPool,
-    private wrappersDir: string,
+    private store: GenerationStore,
     options: { poolSize?: number; maxRunsPerWorker?: number } = {}
   ) {
     this.poolSize = options.poolSize ?? defaultPoolSize();
@@ -266,6 +271,19 @@ export class ExecutionManager {
     );
     const runCtx = contextWithSpan(job.otelContext, runSpan);
 
+    // Pin the current wrapper generation so a mid-run swap doesn't
+    // pull files out from under this execution.
+    const generation = this.store.acquireCurrent();
+    if (!generation) {
+      runSpan.setStatus({ code: SpanStatusCode.ERROR, message: 'no generation' });
+      runSpan.end();
+      job.reject(new Error('No wrapper generation available'));
+      return;
+    }
+
+    runSpan.setAttribute(ATTR.EXECUTION_RUN_ID, runId);
+    runSpan.setAttribute(ATTR.WRAPPER_GENERATION_ID, generation.id);
+
     const timer = setTimeout(() => {
       this.handleTimeout(slot, runId);
     }, job.timeoutMs);
@@ -284,6 +302,7 @@ export class ExecutionManager {
       intermediateResultBytes: 0,
       toolSequence: 0,
       openStages: new Map(),
+      generationId: generation.id,
     };
 
     slot.worker.postMessage({
@@ -291,7 +310,8 @@ export class ExecutionManager {
       id: runId,
       payload: {
         script: job.script,
-        wrappersDir: this.wrappersDir,
+        wrappersDir: generation.dir,
+        generationId: generation.id,
       },
     } satisfies MainToWorker);
   }
@@ -334,6 +354,10 @@ export class ExecutionManager {
 
     if (err) {
       recordException(run.runSpan, err);
+      recordError({ layer: 'exec', type: outcome });
+      // Error signature for dedup (hash of type + first detail location or message)
+      const sig = errorSignature(outcome, err);
+      run.runSpan.setAttribute(ATTR.ERROR_SIGNATURE, sig);
     } else if (outcome === 'success') {
       run.runSpan.setStatus({ code: SpanStatusCode.OK });
     } else {
@@ -350,6 +374,9 @@ export class ExecutionManager {
     if (run.stdoutTruncated || run.stderrTruncated) {
       recordOutputTruncated();
     }
+
+    // Release the pinned generation so GC can reclaim it if stale.
+    this.store.release(run.generationId);
 
     slot.activeRun = null;
   }
@@ -389,6 +416,7 @@ export class ExecutionManager {
       STAGE_SPAN_NAMES[stage],
       run.otelContext,
       {
+        [ATTR.EXECUTION_RUN_ID]: run.id,
         ...(mergedAttrs.cacheHit !== undefined
           ? { [ATTR.BUNDLE_CACHE_HIT]: mergedAttrs.cacheHit }
           : {}),
@@ -419,12 +447,15 @@ export class ExecutionManager {
     const sequence = run.toolSequence;
     run.downstreamCallCount += 1;
 
+    const controller = new AbortController();
     this.inFlightToolCalls.set(msg.id, {
       runId: run.id,
       slotId: slot.id,
+      controller,
     });
 
     const argBytes = jsonByteLength(msg.payload.args);
+    const policy = this.downstream.getToolPolicy(server, tool);
     const start = Date.now();
     const span = startChildSpan(
       `mcp.client ${server}/${tool}`,
@@ -436,16 +467,21 @@ export class ExecutionManager {
         [ATTR.TOOL_CALL_ID]: msg.id,
         [ATTR.TOOL_ARGUMENTS_BYTES]: argBytes,
         [ATTR.TOOL_SEQUENCE]: sequence,
+        [ATTR.EXECUTION_RUN_ID]: run.id,
       }
     );
 
     try {
       const client = this.downstream.getClient(server);
       const result = await otelContextApi.with(run.otelContext, () =>
-        client.callTool({
-          name: tool,
-          arguments: msg.payload.args as Record<string, unknown> | undefined,
-        })
+        client.callTool(
+          {
+            name: tool,
+            arguments: msg.payload.args as Record<string, unknown> | undefined,
+          },
+          undefined,
+          { timeout: policy.timeoutMs, signal: controller.signal }
+        )
       );
 
       this.inFlightToolCalls.delete(msg.id);
@@ -459,6 +495,38 @@ export class ExecutionManager {
       const resultBytes = jsonByteLength(result);
       run.intermediateResultBytes += resultBytes;
 
+      // Oversize guard: reject results exceeding the per-tool limit
+      if (resultBytes > policy.maxResultBytes) {
+        recordToolCallOversize({ server, tool });
+        span.setAttribute(ATTR.TOOL_RESULT_BYTES, resultBytes);
+        span.setAttribute(ATTR.TOOL_OUTCOME, 'tool_error');
+        span.setAttribute('whitenoise.tool_call.oversize', true);
+        span.setStatus({ code: SpanStatusCode.ERROR, message: 'oversize' });
+        span.end();
+        recordToolCall(Date.now() - start, { server, tool, outcome: 'tool_error' });
+        recordToolCallBytes(resultBytes, argBytes, { server, tool });
+
+        if (slot.retiring || !slot.activeRun || slot.activeRun.id !== run.id) {
+          return;
+        }
+
+        const oversizeResult = {
+          isError: true as const,
+          content: [
+            {
+              type: 'text' as const,
+              text: `Result exceeds maxResultBytes (${resultBytes} > ${policy.maxResultBytes}) for ${server}/${tool}`,
+            },
+          ],
+        };
+        slot.worker.postMessage({
+          type: 'callToolResult',
+          id: msg.id,
+          payload: { ok: true, result: oversizeResult },
+        } satisfies MainToWorker);
+        return;
+      }
+
       const outcome: Outcome = toolFailed ? 'tool_error' : 'success';
       span.setAttribute(ATTR.TOOL_RESULT_BYTES, resultBytes);
       span.setAttribute(ATTR.TOOL_RESULT_IS_ERROR, toolFailed);
@@ -471,6 +539,7 @@ export class ExecutionManager {
       span.end();
 
       recordToolCall(Date.now() - start, { server, tool, outcome });
+      recordToolCallBytes(resultBytes, argBytes, { server, tool });
 
       if (slot.retiring || !slot.activeRun || slot.activeRun.id !== run.id) {
         return;
@@ -485,8 +554,15 @@ export class ExecutionManager {
     } catch (err: unknown) {
       this.inFlightToolCalls.delete(msg.id);
 
-      const outcome: Outcome =
-        err instanceof DownstreamUnavailableError
+      const aborted =
+        err instanceof Error &&
+        (err.name === 'AbortError' ||
+          /abort/i.test(err.message) ||
+          controller.signal.aborted);
+
+      const outcome: Outcome = aborted
+        ? 'timeout'
+        : err instanceof DownstreamUnavailableError
           ? 'downstream_unavailable'
           : 'protocol_error';
 
@@ -494,6 +570,7 @@ export class ExecutionManager {
       span.setAttribute(ATTR.TOOL_OUTCOME, outcome);
       span.end();
       recordToolCall(Date.now() - start, { server, tool, outcome });
+      recordError({ layer: 'downstream', type: outcome, server, tool });
 
       console.error('[downstream]', server, 'tool failed', err);
 
@@ -508,7 +585,10 @@ export class ExecutionManager {
         id: msg.id,
         payload: {
           ok: false,
-          error: { message, stack },
+          error: {
+            message: aborted ? `Tool call timed out (${policy.timeoutMs}ms)` : message,
+            stack,
+          },
         },
       } satisfies MainToWorker);
     }
@@ -545,7 +625,8 @@ export class ExecutionManager {
     } else {
       const err = new WorkerExecutionError(
         msg.payload.error.type,
-        msg.payload.error.message
+        msg.payload.error.message,
+        msg.payload.error.details
       );
       const outcome: Outcome =
         msg.payload.error.type === 'COMPILATION_ERROR'
@@ -573,6 +654,7 @@ export class ExecutionManager {
   private rejectInFlightToolCalls(runId: string): void {
     for (const [callId, info] of this.inFlightToolCalls) {
       if (info.runId === runId) {
+        info.controller.abort();
         this.inFlightToolCalls.delete(callId);
       }
     }
@@ -693,4 +775,19 @@ export class ExecutionManager {
 
     return slot;
   }
+}
+
+/** Compute a low-cardinality error signature for dedup. */
+function errorSignature(outcome: string, err: unknown): string {
+  const wErr = err as { details?: Array<{ file?: string; line?: number }> };
+  const firstDetail = wErr?.details?.[0];
+  const loc = firstDetail
+    ? `${firstDetail.file ?? ''}:${firstDetail.line ?? 0}`
+    : '';
+  const msg = err instanceof Error ? err.message : String(err);
+  // Normalize: strip paths and numbers to bound cardinality
+  const normalized = msg.replace(/\/[^\s:]+/g, '<path>').replace(/\d+/g, 'N');
+  return ATTR.ERROR_SIGNATURE === 'whitenoise.error.signature'
+    ? `${outcome}:${loc}:${normalized.slice(0, 100)}`
+    : outcome;
 }

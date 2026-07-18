@@ -64,6 +64,66 @@ describe('ToolCatalog', () => {
     const all = catalog.listAll();
     expect(all.every((e) => e.server !== 'memory')).toBe(true);
     expect(all.some((e) => e.server === 'filesystem')).toBe(true);
+    expect(catalog.getDegradedServers()).toContain('memory');
+  });
+
+  it('retains last-known-good entries when a server fails on a subsequent refresh', async () => {
+    let memoryFails = false;
+    const pool = createFakePool({
+      toolsByServer: {
+        filesystem: [
+          {
+            name: 'read_file',
+            description: 'Read a file',
+            inputSchema: { type: 'object' },
+          },
+        ],
+        memory: [
+          {
+            name: 'create_entities',
+            description: 'Create entities',
+            inputSchema: { type: 'object' },
+          },
+        ],
+      },
+    });
+
+    // Override listTools to toggle failures
+    const origListTools = pool.listTools.bind(pool);
+    pool.listTools = async (server: string) => {
+      if (server === 'memory' && memoryFails) {
+        throw new Error('listTools failed for memory');
+      }
+      return origListTools(server);
+    };
+
+    const catalog = catalogFrom(pool);
+    await catalog.refresh();
+
+    // memory present on first refresh
+    expect(catalog.listAll().some((e) => e.server === 'memory')).toBe(true);
+    expect(catalog.getDegradedServers()).not.toContain('memory');
+
+    // Second refresh: memory fails — entries should be retained (degraded)
+    memoryFails = true;
+    await catalog.refresh();
+
+    const all = catalog.listAll();
+    const memoryEntries = all.filter((e) => e.server === 'memory');
+    expect(memoryEntries.length).toBeGreaterThan(0);
+    expect(memoryEntries.every((e) => e.degraded === true)).toBe(true);
+    expect(catalog.getDegradedServers()).toContain('memory');
+
+    // filesystem still fresh (not degraded)
+    const fsEntries = all.filter((e) => e.server === 'filesystem');
+    expect(fsEntries.every((e) => e.degraded !== true)).toBe(true);
+
+    // Third refresh: memory recovers — degraded flag clears
+    memoryFails = false;
+    await catalog.refresh();
+    expect(catalog.getDegradedServers()).not.toContain('memory');
+    const memoryAfter = catalog.listAll().filter((e) => e.server === 'memory');
+    expect(memoryAfter.every((e) => e.degraded !== true)).toBe(true);
   });
 
   it('includes inputSchemaRaw and description on entries', async () => {

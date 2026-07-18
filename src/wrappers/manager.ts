@@ -1,43 +1,108 @@
-import path from 'node:path';
-import os from 'node:os';
 import { rm, mkdir } from 'node:fs/promises';
+import type { Span } from '@opentelemetry/api';
 import type { ToolCatalog } from '../downstream/catalog.js';
 import { generateWrappers } from './generate.js';
+import { GenerationStore } from './generations.js';
+import { WRAPPERS_ROOT, BASE_TMP } from '../paths.js';
 import { ATTR } from '../telemetry/attributes.js';
-import { recordWrapperGenerated } from '../telemetry/metrics.js';
+import {
+  recordWrapperGenerated,
+  recordWrapperGeneration,
+  recordWrapperSwap,
+} from '../telemetry/metrics.js';
 import { withSpan } from '../telemetry/tracing.js';
 
-const baseTmp = path.join(os.tmpdir(), 'meta-mcp-proxy');
-export const wrappersDir = path.join(baseTmp, 'wrappers');
+let store: GenerationStore | null = null;
 
-export async function prepareWrappers(catalog: ToolCatalog): Promise<void> {
-  // Clean entire base temp directory to remove stale leftovers from crashes
-  await rm(baseTmp, { recursive: true, force: true }).catch(() => {});
-  await mkdir(wrappersDir, { recursive: true });
-
-  await generateWrappersInstrumented(catalog);
+export function getGenerationStore(): GenerationStore {
+  if (!store) {
+    throw new Error('GenerationStore not initialized — call prepareWrappers first');
+  }
+  return store;
 }
 
 /**
- * Regenerate wrappers without nuking the entire baseTmp directory.
- * Safe to call during hot reload - preserves execution sandboxes.
+ * Clean the entire base temp directory and publish the first generation.
+ * Safe to call only at startup when no readers exist.
+ */
+export async function prepareWrappers(catalog: ToolCatalog): Promise<void> {
+  await rm(BASE_TMP, { recursive: true, force: true }).catch(() => {});
+  await mkdir(WRAPPERS_ROOT, { recursive: true });
+
+  store = new GenerationStore(WRAPPERS_ROOT);
+  await store.init();
+
+  await publishGeneration(catalog, 'startup');
+}
+
+/**
+ * Publish a new generation without removing the live one. In-flight
+ * executions pin the previous generation via refcount; stale generations
+ * are garbage-collected once their refcount drops to zero.
  */
 export async function regenerateWrappers(catalog: ToolCatalog): Promise<void> {
-  // Only clear wrappers dir, not the entire baseTmp (preserves sandbox isolation)
-  await rm(wrappersDir, { recursive: true, force: true }).catch(() => {});
-  await mkdir(wrappersDir, { recursive: true });
+  await publishGeneration(catalog, 'hot_reload');
+  const removed = await getGenerationStore().gc();
+  if (removed.length > 0) {
+    console.error(
+      `[wrappers] garbage-collected generations: ${removed.join(', ')}`
+    );
+  }
+}
 
-  await generateWrappersInstrumented(catalog);
+async function publishGeneration(
+  catalog: ToolCatalog,
+  reason: 'startup' | 'hot_reload'
+): Promise<void> {
+  const started = Date.now();
+  const s = getGenerationStoreSafe();
+  let genId = 0;
+  let outcome: 'success' | 'failure' = 'success';
+
+  try {
+    await withSpan(
+      'whitenoise.wrapper.generate',
+      undefined,
+      async (span) => {
+        const result = await s.publish(async (genDir) => {
+          await generateWrappersInstrumented(genDir, catalog, span);
+        });
+        genId = result.id;
+        span.setAttribute(ATTR.WRAPPER_GENERATION_ID, result.id);
+        span.setAttribute(ATTR.WRAPPER_SWAP_REASON, reason);
+        recordWrapperSwap(reason);
+      }
+    );
+  } catch (err) {
+    outcome = 'failure';
+    genId = s.currentCounter;
+    console.error(`[wrappers] generation failed (${reason}):`, err);
+    throw err;
+  } finally {
+    if (genId > 0) {
+      recordWrapperGeneration(Date.now() - started, {
+        generationId: genId,
+        outcome,
+      });
+    }
+  }
 }
 
 async function generateWrappersInstrumented(
-  catalog: ToolCatalog
+  genDir: string,
+  catalog: ToolCatalog,
+  span: Span
 ): Promise<void> {
-  await withSpan('whitenoise.wrapper.generate', undefined, async (span) => {
-    const result = await generateWrappers(wrappersDir, catalog);
-    span.setAttribute(ATTR.WRAPPER_TOOL_COUNT, result.toolCount);
-    span.setAttribute(ATTR.WRAPPER_SERVER_COUNT, result.serverCount);
-    span.setAttribute(ATTR.WRAPPER_FILE_COUNT, result.fileCount);
-    recordWrapperGenerated(result.fileCount);
-  });
+  const result = await generateWrappers(genDir, catalog);
+  span.setAttribute(ATTR.WRAPPER_TOOL_COUNT, result.toolCount);
+  span.setAttribute(ATTR.WRAPPER_SERVER_COUNT, result.serverCount);
+  span.setAttribute(ATTR.WRAPPER_FILE_COUNT, result.fileCount);
+  recordWrapperGenerated(result.fileCount);
+}
+
+function getGenerationStoreSafe(): GenerationStore {
+  if (!store) {
+    throw new Error('GenerationStore not initialized');
+  }
+  return store;
 }

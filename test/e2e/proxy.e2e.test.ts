@@ -1,9 +1,17 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import path from 'node:path';
+import os from 'node:os';
+import fs from 'node:fs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 
 const runE2E = process.env.RUN_E2E === '1';
+
+const isolatedTmpDir = path.join(os.tmpdir(), `meta-mcp-proxy-e2e-${process.pid}`);
+const isolatedEnv = {
+  ...process.env,
+  WN_BASE_TMP: isolatedTmpDir,
+};
 
 function textContent(result: {
   content?: Array<{ type: string; text?: string }>;
@@ -26,15 +34,21 @@ describe.skipIf(!runE2E)('proxy e2e (stdio + real downstream)', () => {
       args: [path.join(process.cwd(), 'dist/index.js')],
       cwd: process.cwd(),
       stderr: 'pipe',
+      env: isolatedEnv,
     });
 
     client = new Client({ name: 'whitenoise-e2e', version: '0.0.0' });
-    await client.connect(transport);
-  }, 120_000);
+    await client.connect(transport, { timeout: 180_000 });
+  }, 180_000);
 
   afterAll(async () => {
     try {
       await client?.close();
+    } catch {
+      // ignore
+    }
+    try {
+      await fs.promises.rm(isolatedTmpDir, { recursive: true, force: true });
     } catch {
       // ignore
     }

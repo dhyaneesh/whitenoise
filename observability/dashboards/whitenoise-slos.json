@@ -1,0 +1,83 @@
+{
+  "title": "WhiteNoise SLOs",
+  "description": "Platform vs user-error separation, downstream health, wrapper generation health, tool call sizes.",
+  "panels": [
+    {
+      "title": "Platform error rate",
+      "query": "sum(rate(whitenoise_error_count_total{layer!=\"catalog\",type!~\"COMPILATION_ERROR|MODULE_NOT_FOUND|INPUT_VALIDATION_ERROR\"}[5m])) / sum(rate(whitenoise_execution_count_total[5m]))",
+      "type": "timeseries",
+      "notes": "Platform failures: downstream, worker, timeout, queue, auth. Target: < 0.5%"
+    },
+    {
+      "title": "User-error rate (compilation/runtime)",
+      "query": "sum(rate(whitenoise_error_count_total{type=~\"COMPILATION_ERROR|MODULE_NOT_FOUND|RUNTIME_ERROR\"}[5m])) / sum(rate(whitenoise_execution_count_total[5m]))",
+      "type": "timeseries",
+      "notes": "Informational — reflects model code quality, not proxy health"
+    },
+    {
+      "title": "Errors by layer and type",
+      "query": "sum by (layer, type) (rate(whitenoise_error_count_total[5m]))",
+      "type": "timeseries"
+    },
+    {
+      "title": "Execution p50/p95/p99 by outcome",
+      "query": "histogram_quantile(0.95, sum(rate(whitenoise_execution_duration_bucket[5m])) by (le, outcome))",
+      "type": "timeseries",
+      "notes": "Also chart p50 and p99"
+    },
+    {
+      "title": "Downstream connection outcomes per server",
+      "query": "sum by (server, outcome) (rate(whitenoise_downstream_connection_count_total[5m]))",
+      "type": "timeseries"
+    },
+    {
+      "title": "Downstream connection duration p95",
+      "query": "histogram_quantile(0.95, sum(rate(whitenoise_downstream_connection_duration_bucket[5m])) by (le, server))",
+      "type": "timeseries"
+    },
+    {
+      "title": "Wrapper generation count by outcome",
+      "query": "sum by (outcome) (rate(whitenoise_wrapper_generation_count_total[5m]))",
+      "type": "timeseries"
+    },
+    {
+      "title": "Wrapper generation duration p95",
+      "query": "histogram_quantile(0.95, sum(rate(whitenoise_wrapper_generation_duration_bucket[5m])) by (le))",
+      "type": "timeseries"
+    },
+    {
+      "title": "Wrapper swaps by reason",
+      "query": "sum by (reason) (rate(whitenoise_wrapper_swap_count_total[5m]))",
+      "type": "timeseries"
+    },
+    {
+      "title": "Tool call result bytes p95",
+      "query": "histogram_quantile(0.95, sum(rate(whitenoise_tool_call_result_bytes_bucket[5m])) by (le, server))",
+      "type": "timeseries"
+    },
+    {
+      "title": "Oversize tool results",
+      "query": "sum by (server, tool) (rate(whitenoise_tool_call_oversize_count_total[5m]))",
+      "type": "timeseries"
+    },
+    {
+      "title": "Catalog degraded servers",
+      "query": "whitenoise_catalog_degraded",
+      "type": "timeseries",
+      "notes": "1 = stale (last-known-good), 0 = fresh"
+    },
+    {
+      "title": "Downstream connected (gauge)",
+      "query": "whitenoise_downstream_connected",
+      "type": "timeseries"
+    }
+  ],
+  "alerts": [
+    "Platform error rate > 0.5% for 10 minutes",
+    "Any auth_failed connection outcome",
+    "Wrapper generation failure (outcome=failure)",
+    "Catalog degraded for > 5 minutes",
+    "Oversize tool results > 0 for 5 minutes",
+    "Downstream server disconnected for > 2 minutes"
+  ]
+}

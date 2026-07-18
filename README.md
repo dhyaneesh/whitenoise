@@ -14,6 +14,8 @@ Standard MCP integrations suffer from two bottlenecks:
 - **Lazy discovery**: Tool definitions live as TypeScript files in a temp directory. The LLM browses them through `list_modules` and `read_module` only when it needs them -- nothing is loaded into context upfront.
 - **Code-level composition**: The LLM writes a single TypeScript snippet that imports multiple wrappers and chains calls directly. Intermediate values flow inside the worker thread without ever leaving the process.
 
+**Benchmark result: an average of 84% token savings** versus vanilla MCP, measured across the multi-server orchestration scenarios in `dashboard/` (context-window schema injection + round-trip chaining combined).
+
 ```typescript
 // One execute_code call replaces multiple round-trips:
 import { readFile } from 'mcp/servers/filesystem/readFile';

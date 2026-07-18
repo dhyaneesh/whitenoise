@@ -1,11 +1,13 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { SpanStatusCode } from '@opentelemetry/api';
-import { DOWNSTREAM_SERVERS, type DownstreamServer } from './servers.js';
+import { DOWNSTREAM_SERVERS, type DownstreamServer, resolveToolPolicy, type ToolPolicy } from './servers.js';
 import { ATTR } from '../telemetry/attributes.js';
 import {
+  recordDownstreamConnection,
   recordDownstreamReconnect,
   registerDownstreamGauges,
+  recordError,
 } from '../telemetry/metrics.js';
 import { getTracer, recordException, withSpan } from '../telemetry/tracing.js';
 
@@ -16,27 +18,58 @@ export class DownstreamUnavailableError extends Error {
   }
 }
 
+export class AuthFailureError extends Error {
+  constructor(public readonly server: string, message: string) {
+    super(`Authentication failed for ${server}: ${message}`);
+    this.name = 'AuthFailureError';
+  }
+}
+
 type ServerState = {
   config: DownstreamServer;
   client: Client;
   transport: StdioClientTransport;
   connected: boolean;
   restarting: boolean;
+  authFailed: boolean;
 };
 
-function buildChildEnv(extra?: Record<string, string>): Record<string, string> {
+/** Environment variables always passed to child processes. */
+const ENV_ALLOWLIST = new Set([
+  'PATH', 'Path', 'HOME', 'USERPROFILE', 'SYSTEMROOT', 'SystemRoot',
+  'COMSPEC', 'TEMP', 'TMP', 'TMPDIR', 'LANG', 'LC_ALL', 'LC_CTYPE',
+  'NODE_OPTIONS', 'npm_config_cache', 'XDG_CACHE_HOME',
+]);
+
+/** Error message patterns indicating a permanent auth failure (not transient). */
+const AUTH_ERROR_PATTERNS =
+  /(?:^|\b)(401|403|unauthorized|invalid.{0,20}(?:api.?key|token|credential)|bad.{0,20}credential|authentication.{0,20}fail)(?:\b|$)/i;
+
+function isAuthError(err: unknown): boolean {
+  if (!err) return false;
+  const msg = err instanceof Error ? err.message : String(err);
+  return AUTH_ERROR_PATTERNS.test(msg);
+}
+
+function buildChildEnv(
+  extra?: Record<string, string>,
+  passthrough?: string[]
+): Record<string, string> {
   const env: Record<string, string> = {};
-
-  for (const [key, value] of Object.entries(process.env)) {
-    if (typeof value === 'string') env[key] = value;
+  const allow = new Set(ENV_ALLOWLIST);
+  if (passthrough) {
+    for (const k of passthrough) allow.add(k);
   }
-
+  for (const [key, value] of Object.entries(process.env)) {
+    if (typeof value === 'string' && allow.has(key)) {
+      env[key] = value;
+    }
+  }
   if (extra) {
     for (const [key, value] of Object.entries(extra)) {
       env[key] = value;
     }
   }
-
   return env;
 }
 
@@ -82,7 +115,11 @@ export class DownstreamPool {
     );
     for (const r of results) {
       if (r.status === 'rejected') {
-        console.error('[downstream] server failed to start:', r.reason);
+        if (r.reason instanceof AuthFailureError) {
+          console.error(`[downstream] ${r.reason.message} — check credentials/env vars`);
+        } else {
+          console.error('[downstream] server failed to start:', r.reason);
+        }
       }
     }
   }
@@ -108,7 +145,11 @@ export class DownstreamPool {
     if (existing && !existing.restarting) {
       throw new Error(`Duplicate server name: ${config.name}`);
     }
+    if (existing?.authFailed) {
+      throw new AuthFailureError(config.name, 'server previously failed auth; not retrying');
+    }
 
+    const connectStart = Date.now();
     await withSpan(
       'whitenoise.downstream.connection',
       {
@@ -123,8 +164,10 @@ export class DownstreamPool {
         const transport = new StdioClientTransport({
           command: config.command,
           args: config.args,
-          env: buildChildEnv(config.env),
+          env: buildChildEnv(config.env, config.envPassthrough),
         });
+
+        let lastError: Error | null = null;
 
         transport.onclose = () => {
           console.warn('[downstream] disconnected:', config.name);
@@ -133,10 +176,33 @@ export class DownstreamPool {
 
         transport.onerror = (err: Error) => {
           console.error('[downstream] error:', config.name, err);
+          lastError = err;
+          if (isAuthError(err)) {
+            const state = this.servers.get(config.name);
+            if (state) state.authFailed = true;
+          }
           void this.handleServerFailure(config.name);
         };
 
-        await client.connect(transport);
+        try {
+          await client.connect(transport);
+        } catch (err) {
+          lastError = err instanceof Error ? err : new Error(String(err));
+          if (isAuthError(lastError)) {
+            recordDownstreamConnection(Date.now() - connectStart, {
+              server: config.name,
+              outcome: 'auth_failed',
+            });
+            span.setAttribute(ATTR.RECONNECT_OUTCOME, 'auth_failed');
+            span.setStatus({ code: SpanStatusCode.ERROR, message: 'auth_failed' });
+            recordException(span, lastError);
+            throw new AuthFailureError(
+              config.name,
+              lastError.message
+            );
+          }
+          throw lastError;
+        }
 
         this.servers.set(config.name, {
           config,
@@ -144,10 +210,16 @@ export class DownstreamPool {
           transport,
           connected: true,
           restarting: false,
+          authFailed: false,
         });
 
+        const duration = Date.now() - connectStart;
+        recordDownstreamConnection(duration, {
+          server: config.name,
+          outcome: 'connected',
+        });
         span.setStatus({ code: SpanStatusCode.OK });
-        console.error(`[downstream] connected: ${config.name}`);
+        console.error(`[downstream] connected: ${config.name} (${duration}ms)`);
       }
     );
   }
@@ -159,6 +231,16 @@ export class DownstreamPool {
     state.restarting = true;
     state.connected = false;
     console.warn('[downstream] restarting:', name);
+
+    // Permanent auth failure — don't retry
+    if (state.authFailed) {
+      recordDownstreamReconnect(name, 'auth_failed');
+      recordError({ layer: 'downstream', type: 'auth_failed', server: name });
+      console.error(`[downstream] auth failure (permanent): ${name}`);
+      this.servers.delete(name);
+      this.notifyChange();
+      return;
+    }
 
     this.servers.delete(name);
     this.notifyChange();
@@ -179,20 +261,33 @@ export class DownstreamPool {
         span.setStatus({ code: SpanStatusCode.OK });
         span.end();
         recordDownstreamReconnect(name, 'success');
-        console.error('[downstream] reconnected:', name);
+        console.error(`[downstream] reconnected: ${name} (${Date.now() - reconnectStart}ms)`);
         this.notifyChange();
         return;
       } catch (err) {
+        // Auth failure during reconnect — stop retrying
+        if (err instanceof AuthFailureError) {
+          span.setAttribute(ATTR.RECONNECT_OUTCOME, 'auth_failed');
+          span.setStatus({ code: SpanStatusCode.ERROR, message: 'auth_failed' });
+          recordException(span, err);
+          span.end();
+          recordDownstreamReconnect(name, 'auth_failed');
+          recordError({ layer: 'downstream', type: 'auth_failed', server: name });
+          console.error(`[downstream] auth failure during reconnect (permanent): ${name}`);
+          this.notifyChange();
+          return;
+        }
+
         console.error(`[downstream] restart failed (${attempt}/5)`, err);
         recordException(span, err);
         span.setAttribute(ATTR.RECONNECT_OUTCOME, 'failure');
         span.end();
         recordDownstreamReconnect(name, 'failure');
-        void reconnectStart;
       }
     }
 
     recordDownstreamReconnect(name, 'gave_up');
+    recordError({ layer: 'downstream', type: 'reconnect_failed', server: name });
     console.error('[downstream] giving up on:', name);
   }
 
@@ -202,6 +297,13 @@ export class DownstreamPool {
       throw new DownstreamUnavailableError(name);
     }
     return state.client;
+  }
+
+  /** Resolve the effective per-tool policy (timeout, max result bytes). */
+  getToolPolicy(server: string, tool: string): ToolPolicy {
+    const state = this.servers.get(server);
+    if (!state) return resolveToolPolicy(undefined, tool);
+    return resolveToolPolicy(state.config.toolPolicies, tool);
   }
 
   async listTools(serverName: string) {

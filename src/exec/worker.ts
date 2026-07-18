@@ -2,7 +2,6 @@
 import { parentPort } from 'node:worker_threads';
 import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
-import os from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { mkdir, writeFile, copyFile, access, stat } from 'node:fs/promises';
 import { context, type BuildContext } from 'esbuild';
@@ -10,15 +9,14 @@ import type {
   MainToWorker,
   WorkerToMain,
   WorkerStage,
-  WorkerErrorType,
 } from './protocol.js';
 import { mcpResolverPlugin } from './esbuildPlugin.js';
+import { classifyWorkerError } from './classify.js';
+import { BUNDLE_CACHE_ROOT, EXEC_ROOT } from '../paths.js';
 
-/** Shared temp base with wrappers — outside the repo / filesystem-server root */
-const EXEC_BASE = path.join(os.tmpdir(), 'meta-mcp-proxy', 'exec');
-const CACHE_DIR = path.join(EXEC_BASE, 'cache');
+/** Per-worker scratch directory for entry files (outside the repo) */
 const WORK_DIR = path.join(
-  EXEC_BASE,
+  EXEC_ROOT,
   `w-${process.pid}-${randomUUID().slice(0, 8)}`
 );
 
@@ -66,49 +64,13 @@ function callMCPTool(fqTool: string, args: unknown): Promise<unknown> {
 // Make it available globally BEFORE any bundle import
 (globalThis as any).__callMCPTool = callMCPTool;
 
-function hashScript(script: string, wrappersDir: string): string {
+function hashScript(script: string, generationId: number): string {
   return createHash('sha256')
-    .update(wrappersDir)
+    .update(String(generationId))
     .update('\0')
     .update(script)
     .digest('hex')
     .slice(0, 32);
-}
-
-function classifyWorkerError(err: unknown): {
-  type: WorkerErrorType;
-  message: string;
-} {
-  const message =
-    err instanceof Error
-      ? err.message
-      : typeof err === 'string'
-        ? err
-        : 'Unknown worker error';
-
-  if (/hard timeout/i.test(message)) {
-    return { type: 'HARD_TIMEOUT', message };
-  }
-
-  // esbuild BuildFailure typically has errors[] with location/text
-  const anyErr = err as { errors?: unknown[]; name?: string };
-  if (
-    Array.isArray(anyErr?.errors) ||
-    anyErr?.name === 'BuildFailure' ||
-    /Transform failed|Build failed|ERROR:/i.test(message)
-  ) {
-    return { type: 'COMPILATION_ERROR', message };
-  }
-
-  if (
-    /Cannot find module|MODULE_NOT_FOUND|ENOENT|ERR_MODULE_NOT_FOUND/i.test(
-      message
-    )
-  ) {
-    return { type: 'MODULE_NOT_FOUND', message };
-  }
-
-  return { type: 'RUNTIME_ERROR', message };
 }
 
 async function getOrCreateContext(
@@ -156,10 +118,12 @@ async function getOrCreateContext(
 async function getBundlePath(
   script: string,
   wrappersDir: string,
+  generationId: number,
   runId: string
 ): Promise<{ path: string; cacheHit: boolean; bundleBytes?: number }> {
   emitStage(runId, 'bundle.cache_lookup', 'start');
-  const hash = hashScript(script, wrappersDir);
+  const hash = hashScript(script, generationId);
+  const genCacheDir = path.join(BUNDLE_CACHE_ROOT, `gen-${generationId}`);
   const cached = bundleCache.get(hash);
   if (cached) {
     try {
@@ -175,7 +139,7 @@ async function getBundlePath(
     }
   }
 
-  const cachePath = path.join(CACHE_DIR, `${hash}.mjs`);
+  const cachePath = path.join(genCacheDir, `${hash}.mjs`);
   try {
     await access(cachePath);
     bundleCache.set(hash, cachePath);
@@ -204,7 +168,7 @@ async function getBundlePath(
   emitStage(runId, 'bundle.rebuild', 'end');
 
   emitStage(runId, 'bundle.cache_write', 'start');
-  await mkdir(CACHE_DIR, { recursive: true });
+  await mkdir(genCacheDir, { recursive: true });
   await copyFile(outfile, cachePath);
   const st = await stat(cachePath);
   emitStage(runId, 'bundle.cache_write', 'end', { bundleBytes: st.size });
@@ -233,6 +197,7 @@ parentPort!.on('message', async (msg: MainToWorker) => {
       const { path: bundlePath } = await getBundlePath(
         msg.payload.script,
         msg.payload.wrappersDir,
+        msg.payload.generationId,
         runId
       );
 

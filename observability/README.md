@@ -83,6 +83,57 @@ JSON panel catalogs live in [`dashboards/`](./dashboards/). Recreate them in the
 1. [MCP Proxy Health](./dashboards/mcp-proxy-health.json)
 2. [Downstream MCP Servers](./dashboards/downstream-mcp-servers.json)
 3. [WhiteNoise Efficiency](./dashboards/whitenoise-efficiency.json)
+4. [WhiteNoise SLOs](./dashboards/whitenoise-slos.json)
+
+## Metrics catalog
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `whitenoise.execution.duration` | histogram | outcome | execute_code wall duration |
+| `whitenoise.execution.count` | counter | outcome | Runs by outcome |
+| `whitenoise.execution.queue_wait` | histogram | — | Queue wait time |
+| `whitenoise.tool_call.duration` | histogram | server, tool, outcome | Downstream call latency |
+| `whitenoise.tool_call.count` | counter | server, tool, outcome | Downstream call count |
+| `whitenoise.tool_call.result.bytes` | histogram | server, tool | Result size |
+| `whitenoise.tool_call.arguments.bytes` | histogram | server, tool | Arguments size |
+| `whitenoise.tool_call.oversize.count` | counter | server, tool | Results exceeding maxResultBytes |
+| `whitenoise.downstream.connection.duration` | histogram | server, outcome | Connection setup time |
+| `whitenoise.downstream.connection.count` | counter | server, outcome | Connection attempts |
+| `whitenoise.downstream.reconnect.count` | counter | server, outcome | Reconnect attempts |
+| `whitenoise.downstream.connected` | gauge | server | 1 if connected |
+| `whitenoise.wrapper.generation.count` | counter | generation_id, outcome | Generation publications |
+| `whitenoise.wrapper.generation.duration` | histogram | generation_id, outcome | Generation publish time |
+| `whitenoise.wrapper.swap.count` | counter | reason | Swaps (startup\|hot_reload) |
+| `whitenoise.catalog.degraded` | gauge | server | 1 if entries are last-known-good |
+| `whitenoise.error.count` | counter | layer, type, server?, tool? | Errors — never raw message |
+
+## SLO definitions
+
+WhiteNoise distinguishes **platform failures** (infrastructure problems the model/user cannot fix) from **user/model errors** (bad code, invalid input):
+
+| SLI | Calculation | Example types |
+|-----|-------------|---------------|
+| **Platform availability** | `1 - error.count{layer∈(proxy,exec,downstream), type∉(COMPILATION_ERROR,MODULE_NOT_FOUND,INPUT_VALIDATION_ERROR)} / execution.count` | `DOWNSTREAM_UNAVAILABLE`, `WORKER_CRASH`, `EXECUTION_TIMEOUT`, `QUEUE_FULL`, `auth_failed`, `reconnect_failed` |
+| **User-error rate** | `error.count{type∈(COMPILATION_ERROR,MODULE_NOT_FOUND,RUNTIME_ERROR)} / execution.count` | `COMPILATION_ERROR`, `RUNTIME_ERROR` |
+
+Suggested SLO targets:
+- Platform availability ≥ 99.5% over 5-minute windows
+- User-error rate: informational (not an SLO — reflects model code quality, not proxy health)
+
+### Example SigNoz queries
+
+```promql
+# Platform error rate
+sum(rate(whitenoise_error_count_total{layer!="catalog",type!~"COMPILATION_ERROR|MODULE_NOT_FOUND|INPUT_VALIDATION_ERROR"}[5m]))
+  /
+sum(rate(whitenoise_execution_count_total[5m]))
+
+# Per-server downstream connection outcomes
+sum by (server, outcome) (rate(whitenoise_downstream_connection_count_total[5m]))
+
+# Wrapper generation health
+sum by (outcome) (rate(whitenoise_wrapper_generation_count_total[5m]))
+```
 
 ## Environment variables
 

@@ -42,9 +42,20 @@ type Instruments = {
   catalogRefreshFailedServers: Counter;
   catalogRefreshCoalesced: Counter;
   wrapperGeneratedCount: Counter;
+  wrapperGenerationCount: Counter;
+  wrapperGenerationDuration: Histogram;
+  wrapperSwapCount: Counter;
   downstreamReconnectCount: Counter;
   modulesRead: Counter;
+  toolCallResultBytes: Histogram;
+  toolCallArgumentsBytes: Histogram;
+  toolCallOversizeCount: Counter;
+  downstreamConnectionDuration: Histogram;
+  downstreamConnectionCount: Counter;
+  errorCount: Counter;
 };
+
+export type ErrorLayer = 'proxy' | 'exec' | 'worker' | 'downstream' | 'catalog';
 
 let instruments: Instruments | null = null;
 
@@ -133,12 +144,50 @@ function ensureInstruments(): Instruments {
       'whitenoise.wrapper.generated_count',
       { description: 'Wrapper files generated' }
     ),
+    wrapperGenerationCount: m.createCounter(
+      'whitenoise.wrapper.generation.count',
+      { description: 'Wrapper generation publications by outcome' }
+    ),
+    wrapperGenerationDuration: m.createHistogram(
+      'whitenoise.wrapper.generation.duration',
+      { unit: 'ms', description: 'Time to publish a wrapper generation' }
+    ),
+    wrapperSwapCount: m.createCounter('whitenoise.wrapper.swap.count', {
+      description: 'Wrapper generation swaps by reason (startup|hot_reload)',
+    }),
     downstreamReconnectCount: m.createCounter(
       'whitenoise.downstream.reconnect.count',
       { description: 'Downstream reconnect attempts by outcome' }
     ),
     modulesRead: m.createCounter('whitenoise.context.modules_read', {
       description: 'read_module calls',
+    }),
+    toolCallResultBytes: m.createHistogram('whitenoise.tool_call.result.bytes', {
+      unit: 'By',
+      description: 'Downstream tool call result size in bytes',
+    }),
+    toolCallArgumentsBytes: m.createHistogram(
+      'whitenoise.tool_call.arguments.bytes',
+      {
+        unit: 'By',
+        description: 'Downstream tool call arguments size in bytes',
+      }
+    ),
+    toolCallOversizeCount: m.createCounter(
+      'whitenoise.tool_call.oversize.count',
+      { description: 'Tool calls whose result exceeded maxResultBytes' }
+    ),
+    downstreamConnectionDuration: m.createHistogram(
+      'whitenoise.downstream.connection.duration',
+      { unit: 'ms', description: 'Downstream server connection duration' }
+    ),
+    downstreamConnectionCount: m.createCounter(
+      'whitenoise.downstream.connection.count',
+      { description: 'Downstream connection attempts by server and outcome' }
+    ),
+    errorCount: m.createCounter('whitenoise.error.count', {
+      description:
+        'Errors by layer, type, server, and tool. Low-cardinality labels only — never the raw message.',
     }),
   };
   return instruments;
@@ -321,13 +370,92 @@ export function recordWrapperGenerated(fileCount: number): void {
   ensureInstruments().wrapperGeneratedCount.add(fileCount);
 }
 
+export function recordWrapperGeneration(
+  durationMs: number,
+  attrs: { generationId: number; outcome: 'success' | 'failure' }
+): void {
+  const i = ensureInstruments();
+  i.wrapperGenerationDuration.record(durationMs, {
+    generation_id: String(attrs.generationId),
+    outcome: attrs.outcome,
+  });
+  i.wrapperGenerationCount.add(1, {
+    generation_id: String(attrs.generationId),
+    outcome: attrs.outcome,
+  });
+}
+
+export function recordWrapperSwap(reason: 'startup' | 'hot_reload'): void {
+  ensureInstruments().wrapperSwapCount.add(1, { reason });
+}
+
 export function recordDownstreamReconnect(
   server: string,
-  outcome: 'success' | 'failure' | 'gave_up'
+  outcome: 'success' | 'failure' | 'gave_up' | 'auth_failed'
 ): void {
   ensureInstruments().downstreamReconnectCount.add(1, { server, outcome });
 }
 
 export function recordModuleRead(): void {
   ensureInstruments().modulesRead.add(1);
+}
+
+export function recordToolCallBytes(
+  resultBytes: number,
+  argumentsBytes: number,
+  attrs: { server: string; tool: string }
+): void {
+  const i = ensureInstruments();
+  i.toolCallResultBytes.record(resultBytes, attrs);
+  i.toolCallArgumentsBytes.record(argumentsBytes, attrs);
+}
+
+export function recordToolCallOversize(
+  attrs: { server: string; tool: string }
+): void {
+  ensureInstruments().toolCallOversizeCount.add(1, attrs);
+}
+
+export function recordDownstreamConnection(
+  durationMs: number,
+  attrs: { server: string; outcome: 'connected' | 'failed' | 'auth_failed' }
+): void {
+  const i = ensureInstruments();
+  i.downstreamConnectionDuration.record(durationMs, attrs);
+  i.downstreamConnectionCount.add(1, attrs);
+}
+
+export function recordError(attrs: {
+  layer: ErrorLayer;
+  type: string;
+  server?: string;
+  tool?: string;
+}): void {
+  ensureInstruments().errorCount.add(1, attrs);
+}
+
+export type CatalogGaugeCallbacks = {
+  degradedServers: () => Array<{ server: string; degraded: number }>;
+};
+
+let catalogGaugesRegistered = false;
+let catalogCallbacks: CatalogGaugeCallbacks | null = null;
+
+export function registerCatalogGauges(callbacks: CatalogGaugeCallbacks): void {
+  catalogCallbacks = callbacks;
+  if (catalogGaugesRegistered) return;
+  catalogGaugesRegistered = true;
+  const m = getMeter();
+  const degraded = m.createObservableGauge('whitenoise.catalog.degraded', {
+    description: '1 if server catalog entries are stale (last-known-good), else 0',
+  });
+  m.addBatchObservableCallback(
+    (result: BatchObservableResult) => {
+      if (!catalogCallbacks) return;
+      for (const row of catalogCallbacks.degradedServers()) {
+        result.observe(degraded, row.degraded, { server: row.server });
+      }
+    },
+    [degraded]
+  );
 }
