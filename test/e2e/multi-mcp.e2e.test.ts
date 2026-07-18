@@ -489,12 +489,15 @@ import { readFile } from 'mcp/servers/filesystem/readFile';
 import { createEntities } from 'mcp/servers/memory/createEntities';
 import { readGraph } from 'mcp/servers/memory/readGraph';
 
-let context7Result = 'skipped';
+// Simulate a failed tool call (non-existent file) and verify the script
+// continues with the remaining tools.
+let failureResult = 'skipped';
 try {
-  const { queryDocs } = await import('mcp/servers/context7/queryDocs');
-  context7Result = unwrap(await queryDocs({ query: 'test', languages: ['typescript'] }));
+  // This will fail — the file does not exist
+  const bad = unwrap(await readFile({ path: '/nonexistent/path/that/does/not/exist.txt' }));
+  failureResult = 'unexpected_success';
 } catch (e) {
-  context7Result = 'failed_as_expected: ' + (e as Error).message;
+  failureResult = 'failed_as_expected: ' + (e as Error).message;
 }
 
 const content = unwrap(await readFile({ path: ${JSON.stringify(pkgPath)} }));
@@ -502,12 +505,12 @@ await createEntities({
   entities: [{
     name: 'resilience_test',
     entityType: 'test_result',
-    observations: ['package_read_ok', 'context7_' + context7Result]
+    observations: ['package_read_ok', 'failure_' + failureResult]
   }]
 });
 const graph = unwrap(await readGraph({}));
 
-console.log('RESILIENCE_OK context7=' + context7Result + ' nodes=' + graph.entities.length);
+console.log('RESILIENCE_OK failure=' + failureResult + ' nodes=' + graph.entities.length);
 `;
 
     const result = await client.callTool({
