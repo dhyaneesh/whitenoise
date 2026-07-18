@@ -2,12 +2,35 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
+import net from 'node:net';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 
 const runE2E = process.env.RUN_E2E === '1';
 
 const isolatedTmpDir = path.join(os.tmpdir(), `meta-mcp-proxy-multi-${process.pid}`);
+
+// Cred/service availability — tests that need them skip when absent.
+// Evaluated at module load time so it.skipIf guards work.
+const hasBrave = !!process.env.BRAVE_API_KEY;
+const hasGithub = !!process.env.GITHUB_PERSONAL_ACCESS_TOKEN;
+
+async function checkPostgres(): Promise<boolean> {
+  return new Promise((resolve) => {
+    const sock = net.createConnection({ host: '127.0.0.1', port: 5432 }, () => {
+      sock.destroy();
+      resolve(true);
+    });
+    sock.on('error', () => resolve(false));
+    sock.setTimeout(1000, () => {
+      sock.destroy();
+      resolve(false);
+    });
+  });
+}
+
+// Top-level await — vitest supports this in ESM test files
+const hasPostgres = await checkPostgres();
 
 function textContent(result: {
   content?: Array<{ type: string; text?: string }>;
@@ -40,15 +63,20 @@ function ${helperName}(result: any): any {
 `;
 }
 
+const REPO = process.cwd();
+const TMP_DIR = path.join(REPO, 'tmp');
+
 describe.skipIf(!runE2E)('multi-mcp orchestration e2e', () => {
   let client: Client;
   let transport: StdioClientTransport;
 
   beforeAll(async () => {
+    await fs.promises.mkdir(TMP_DIR, { recursive: true }).catch(() => {});
+
     transport = new StdioClientTransport({
       command: 'node',
-      args: [path.join(process.cwd(), 'dist/index.js')],
-      cwd: process.cwd(),
+      args: [path.join(REPO, 'dist/index.js')],
+      cwd: REPO,
       stderr: 'pipe',
       env: {
         ...process.env,
@@ -72,7 +100,7 @@ describe.skipIf(!runE2E)('multi-mcp orchestration e2e', () => {
 
   // ── Tier E1: Web Research & Knowledge Graph ──────────────────
 
-  it('E1: search web, store in memory graph, write report (3 MCPs)', async () => {
+  it.skipIf(!hasBrave)('E1: search web, store in memory graph, write report (3 MCPs)', async () => {
     const search = await client.callTool({
       name: 'search_tools',
       arguments: { query: 'web search', limit: 10 },
@@ -91,6 +119,7 @@ describe.skipIf(!runE2E)('multi-mcp orchestration e2e', () => {
     const source = textContent(read as any);
     expect(source).toContain('export');
 
+    const reportPath = path.join(TMP_DIR, 'e1-report.md');
     const code = `
 ${unwrapCode()}
 import { braveWebSearch } from 'mcp/servers/braveSearch/braveWebSearch';
@@ -114,7 +143,7 @@ for (const [i, r] of results.entries()) {
 const graph = unwrap(await readGraph({}));
 
 const report = JSON.stringify({ searchResults: results.length, graphNodes: graph.entities.length, sample: results[0] }, null, 2);
-await writeFile({ path: '/mnt/c/Users/Dhyaneesh/whitenoise/tmp/e1-report.md', content: report });
+await writeFile({ path: ${JSON.stringify(reportPath)}, content: report });
 
 console.log('E1_OK');
 `;
@@ -131,7 +160,7 @@ console.log('E1_OK');
       arguments: {
         code: `
 import { readFile } from 'mcp/servers/filesystem/readFile';
-const content = await readFile({ path: '/mnt/c/Users/Dhyaneesh/whitenoise/tmp/e1-report.md' });
+const content = await readFile({ path: ${JSON.stringify(reportPath)} });
 console.log(content);
 `,
         timeoutMs: 10_000,
@@ -144,6 +173,7 @@ console.log(content);
   // ── Tier E2: Project Health Check ─────────────────────────────
 
   it('E2: github + filesystem + sequentialThinking (3 MCPs)', async () => {
+    const reportPath = path.join(TMP_DIR, 'e2-health.json');
     const code = `
 ${unwrapCode()}
 import { searchRepositories } from 'mcp/servers/github/searchRepositories';
@@ -152,7 +182,7 @@ import { readFile } from 'mcp/servers/filesystem/readFile';
 import { sequentialthinking } from 'mcp/servers/sequentialThinking/sequentialthinking';
 import { writeFile } from 'mcp/servers/filesystem/writeFile';
 
-const repoPath = '/mnt/c/Users/Dhyaneesh/whitenoise';
+const repoPath = ${JSON.stringify(REPO)};
 
 let githubResult = 'not_found';
 try {
@@ -170,7 +200,7 @@ const pkg = JSON.parse(pkgRawResult.content || pkgRawResult);
 const reasoning = unwrap(await sequentialthinking({ thought: \`Project has package \${pkg.name}, GitHub search: \${githubResult}. Tree has entries. Is this well maintained?\`, nextThoughtNeeded: true, thoughtNumber: 1, totalThoughts: 3 }));
 
 const report = JSON.stringify({ githubStatus: githubResult, pkgName: pkg.name, reasoning: reasoning.thought }, null, 2);
-await writeFile({ path: '/mnt/c/Users/Dhyaneesh/whitenoise/tmp/e2-health.json', content: report });
+await writeFile({ path: ${JSON.stringify(reportPath)}, content: report });
 
 console.log('E2_OK');
 `;
@@ -185,7 +215,8 @@ console.log('E2_OK');
 
   // ── Tier E3: Web Research to Knowledge Graph ──────────────────
 
-  it('E3: braveSearch + memory + filesystem (3 MCPs)', async () => {
+  it.skipIf(!hasBrave)('E3: braveSearch + memory + filesystem (3 MCPs)', async () => {
+    const reportPath = path.join(TMP_DIR, 'e3-knowledge.json');
     const code = `
 ${unwrapCode()}
 import { braveWebSearch } from 'mcp/servers/braveSearch/braveWebSearch';
@@ -217,7 +248,7 @@ for (let i = 0; i < entities.length - 1; i++) {
 const found = unwrap(await searchNodes({ query: 'AI' }));
 
 const report = JSON.stringify({ results: results.length, graphEntities: entities.length, matchedNodes: found.entities.length }, null, 2);
-await writeFile({ path: '/mnt/c/Users/Dhyaneesh/whitenoise/tmp/e3-knowledge.json', content: report });
+await writeFile({ path: ${JSON.stringify(reportPath)}, content: report });
 
 console.log('E3_OK');
 `;
@@ -232,7 +263,8 @@ console.log('E3_OK');
 
   // ── Tier M1: Competitive Intelligence ─────────────────────────
 
-  it('M1: braveSearch + github + filesystem + memory + sequentialThinking + everything (6 MCPs)', async () => {
+  it.skipIf(!hasBrave)('M1: braveSearch + github + filesystem + memory + sequentialThinking + everything (6 MCPs)', async () => {
+    const reportPath = path.join(TMP_DIR, 'm1-competitors.json');
     const code = `
 ${unwrapCode()}
 import { braveWebSearch } from 'mcp/servers/braveSearch/braveWebSearch';
@@ -247,7 +279,7 @@ import { writeFile } from 'mcp/servers/filesystem/writeFile';
 const [webResultsRaw, githubReposRaw, treeRaw] = await Promise.all([
   braveWebSearch({ query: 'MCP proxy meta-tool competitor whitenoise alternative 2024', count: 3 }).catch(() => ({ content: [{ type: 'text', text: '{"results":[]}' }] })),
   searchRepositories({ query: 'MCP proxy', sort: 'stars', order: 'desc' }).catch(() => ({ content: [{ type: 'text', text: '[]' }] })),
-  directoryTree({ path: '/mnt/c/Users/Dhyaneesh/whitenoise/src' }),
+  directoryTree({ path: ${JSON.stringify(REPO + '/src')} }),
 ]);
 
 const webResultsRawParsed = (() => { try { return unwrap(webResultsRaw); } catch { return { results: [] }; } })();
@@ -283,7 +315,7 @@ const report = JSON.stringify({
   graphEntities: graph.entities.length,
   reasoning: reasoning.thought,
 }, null, 2);
-await writeFile({ path: '/mnt/c/Users/Dhyaneesh/whitenoise/tmp/m1-competitors.json', content: report });
+await writeFile({ path: ${JSON.stringify(reportPath)}, content: report });
 
 console.log('M1_OK');
 `;
@@ -298,7 +330,8 @@ console.log('M1_OK');
 
   // ── Tier M3: Data Migration Pipeline ──────────────────────────
 
-  it('M3: memory + postgres + sequentialThinking + filesystem + github (5 MCPs)', async () => {
+  it.skipIf(!hasPostgres)('M3: memory + postgres + sequentialThinking + filesystem + github (5 MCPs)', async () => {
+    const reportPath = path.join(TMP_DIR, 'm3-migration.json');
     const code = `
 ${unwrapCode()}
 import { createEntities } from 'mcp/servers/memory/createEntities';
@@ -352,7 +385,7 @@ const log = JSON.stringify({
   plan: plan.thought,
   githubBonus: githubResult,
 }, null, 2);
-await writeFile({ path: '/mnt/c/Users/Dhyaneesh/whitenoise/tmp/m3-migration.json', content: log });
+await writeFile({ path: ${JSON.stringify(reportPath)}, content: log });
 
 console.log('M3_OK');
 `;
@@ -367,7 +400,8 @@ console.log('M3_OK');
 
   // ── Tier H1: Autonomous Research Agent ────────────────────────
 
-  it('H1: research agent with web + github + filesystem + memory + postgres + sequentialThinking (6 MCPs)', async () => {
+  it.skipIf(!hasBrave || !hasPostgres)('H1: research agent with web + github + filesystem + memory + postgres + sequentialThinking (6 MCPs)', async () => {
+    const reportPath = path.join(TMP_DIR, 'h1-research.json');
     const code = `
 ${unwrapCode()}
 import { braveWebSearch } from 'mcp/servers/braveSearch/braveWebSearch';
@@ -382,8 +416,8 @@ import { writeFile } from 'mcp/servers/filesystem/writeFile';
 
 const [webResultsRaw, treeRaw, pkgRawRaw] = await Promise.all([
   braveWebSearch({ query: 'AI agent framework 2024 2025', count: 3 }).catch(() => ({ content: [{ type: 'text', text: '{"results":[]}' }] })),
-  directoryTree({ path: '/mnt/c/Users/Dhyaneesh/whitenoise/src' }),
-  readFile({ path: '/mnt/c/Users/Dhyaneesh/whitenoise/package.json' }).catch(() => ({ content: [{ type: 'text', text: '{}' }] })),
+  directoryTree({ path: ${JSON.stringify(REPO + '/src')} }),
+  readFile({ path: ${JSON.stringify(REPO + '/package.json')} }).catch(() => ({ content: [{ type: 'text', text: '{}' }] })),
 ]);
 
 const webResultsRawParsed = (() => { try { return unwrap(webResultsRaw); } catch { return { results: [] }; } })();
@@ -432,7 +466,7 @@ const report = JSON.stringify({
   graphEntities: graph.entities.length,
   pgRows: pgRows[0].c,
 }, null, 2);
-await writeFile({ path: '/mnt/c/Users/Dhyaneesh/whitenoise/tmp/h1-research.json', content: report });
+await writeFile({ path: ${JSON.stringify(reportPath)}, content: report });
 
 console.log('H1_OK');
 `;
@@ -448,6 +482,7 @@ console.log('H1_OK');
   // ── Stress test: Error resilience ─────────────────────────────
 
   it('handles a failed MCP gracefully and continues with others', async () => {
+    const pkgPath = path.join(REPO, 'package.json');
     const code = `
 ${unwrapCode()}
 import { readFile } from 'mcp/servers/filesystem/readFile';
@@ -462,7 +497,7 @@ try {
   context7Result = 'failed_as_expected: ' + (e as Error).message;
 }
 
-const content = unwrap(await readFile({ path: '/mnt/c/Users/Dhyaneesh/whitenoise/package.json' }));
+const content = unwrap(await readFile({ path: ${JSON.stringify(pkgPath)} }));
 await createEntities({
   entities: [{
     name: 'resilience_test',
